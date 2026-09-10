@@ -127,9 +127,11 @@ truncation or a missing marker as passing. Generated C# has not been compiled.
 
 ## Evidence Limits
 
-On September 9, 2026, a development build with both corrections completed Q8
+On September 9, 2026, a development build with the processor correction and the
+older MLX-LM cache-level workaround completed Q8
 (17,992 output tokens) and BF16 (19,211 output tokens) sustained workloads and
 the cached 243k conversations on four M3 Ultra nodes. These are historical
-compatibility observations, not a four-node validation of this upstream port.
+compatibility observations, not a four-node validation of this upstream port or
+its new EXO-side generation-boundary correction.
 The public-source component checks ran on macOS 26.6.1 (25G76). Full-window cold
 prefill, concurrency, overnight stability and multimodal inference remain unqualified.
