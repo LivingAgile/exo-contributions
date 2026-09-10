@@ -2,7 +2,11 @@ from dataclasses import dataclass, field
 from typing import cast
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 from mlx_lm.generate import GenerationBatch
+from mlx_lm.models.cache import ArraysCache
+
+from exo.worker.engines.mlx.types import KVCacheType
 
 _PRECOMPUTE_TOP_K = 20
 
@@ -90,6 +94,20 @@ def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
     self._next_tokens = sampled
     self._next_logprobs = logprobs
 
+    prompt_cache = cast(KVCacheType, self.prompt_cache)
+    state_leaves = cast(
+        list[tuple[str, object]],
+        tree_flatten([cache.state for cache in prompt_cache]),
+    )
+    cache_states = [value for _, value in state_leaves if isinstance(value, mx.array)]
+    cache_metadata = [
+        metadata
+        for cache in prompt_cache
+        if isinstance(cache, ArraysCache)
+        for metadata in (cache.lengths, cache.left_padding)
+        if metadata is not None
+    ]
+
     if buf.needs_topk:
         batch_size = len(self.uids)
         k = min(_PRECOMPUTE_TOP_K, logprobs.shape[1])
@@ -111,9 +129,13 @@ def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
             pending_indices,
             pending_values,
             pending_selected,
+            *cache_states,
+            *cache_metadata,
         )
     else:
-        mx.async_eval(self._next_tokens, self._next_logprobs)
+        mx.async_eval(
+            self._next_tokens, self._next_logprobs, *cache_states, *cache_metadata
+        )
 
     current_lp = self._current_logprobs
     if isinstance(current_lp, mx.array):

@@ -2,16 +2,18 @@
 
 This contribution targets Q8 and BF16 text generation on Apple Silicon. The cards
 do not advertise vision, CUDA or CPU qualification. No weights are included.
-The processor and cache corrections address separate failures; the Nix override
-applies the cache correction to EXO's actual MLX-LM dependency. `uv run exo` does
-not apply this Nix-only patch. Dependency pins are unchanged in `uv.lock`.
+The processor and cache corrections address separate failures. EXO's overridden
+generation step evaluates every cache's arrays and explicitly includes recurrent
+length/padding metadata omitted by the pinned MLX-LM cache interface. Both
+top-logprob modes use the existing asynchronous boundary. This correction is
+EXO-owned, applies to both Nix and uv source builds, and requires no MLX-LM patch.
+Dependency pins are unchanged in `uv.lock`.
 
-The cache patch adapts only `ArraysCache.advance()` from Pierre Lamy's
-[bb615eb patch](https://github.com/pierre427/mlx-lm/commit/bb615ebdb5aff33eb931ac0627cae142bd7adbaa),
-not its `extract()` change. Related upstream work includes
-[MLX-LM #1632](https://github.com/ml-explore/mlx-lm/pull/1632) and
-[#1845](https://github.com/ml-explore/mlx-lm/issues/1845). A companion MLX-LM PR
-has not yet been published. These references do not imply endorsement.
+Related upstream work includes [MLX-LM #1632](https://github.com/ml-explore/mlx-lm/pull/1632)
+and [#1845](https://github.com/ml-explore/mlx-lm/issues/1845). The separate native
+MLX-LM batch-generator issue does not fix EXO's overridden step. The earlier
+Nix-carried `ArraysCache.advance()` workaround is absent from this candidate.
+These references do not imply endorsement or distributed qualification.
 
 ## Component Checks
 
@@ -22,12 +24,17 @@ Use Python without `-O` or `PYTHONOPTIMIZE`; the scripts include assertions.
 set -e
 EXO_TEST_PYTHON_ENV="$(nix build --no-link --print-out-paths path:.#exo.venv)"
 EXO_TEST_DASHBOARD="$(nix build --no-link --print-out-paths path:.#dashboard)"
-"$EXO_TEST_PYTHON_ENV/bin/python" nix/tests/arrays-cache-metadata-regression.py
+TEST_ENV="$(nix build --no-link --print-out-paths path:.#exo-test-env)"
+EXO_HOME="$(mktemp -d)" EXO_DASHBOARD_DIR="$EXO_TEST_DASHBOARD" \
+  PYTHONPATH="$PWD/src" "$TEST_ENV/bin/python" -m pytest \
+  src/exo/worker/engines/mlx/tests/test_batch_generate.py \
+  -k test_batch_step_evaluates_recurrent_metadata
 ```
 
-Expected: `arrays-cache metadata regression: PASS`. No weights or EXO service
-are needed. This checks metadata graph bounds after 256 cache advances and the
-final numerical values, not distributed inference or long-run resource usage.
+Expected: two passed cases. No model downloads or EXO service are needed. A small
+random eight-layer Qwen3-Next runs through the actual installed EXO batch step,
+checking all recurrent layers, metadata values, top-logprob alignment, output
+agreement and cleanup. This is not distributed inference or long-run resource proof.
 
 Download the complete model repositories at these revisions using Hugging Face:
 

@@ -10,6 +10,7 @@ identical token selections to running them sequentially (B=1).
 Uses random weights — no model download required.
 """
 
+import io
 from pathlib import Path
 from typing import cast
 
@@ -29,6 +30,101 @@ from exo.worker.engines.mlx.generator.generate import prefill
 from exo.worker.engines.mlx.types import Model
 
 NUM_STEPS = 20
+
+
+@pytest.mark.parametrize("needs_topk", [False, True])
+def test_batch_step_evaluates_recurrent_metadata(
+    needs_topk: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mlx_lm.generate import (
+        BatchGenerator,
+        GenerationBatch,
+        generate_step,
+        generation_stream,
+    )
+    from mlx_lm.models import qwen3_next
+    from mlx_lm.models.cache import ArraysCache
+
+    from exo.worker.engines.mlx.patches.opt_batch_gen import (
+        apply_batch_gen_patch,
+        set_needs_topk,
+        take_ready_topk,
+    )
+
+    monkeypatch.setattr(GenerationBatch, "_step", GenerationBatch._step)
+    apply_batch_gen_patch()
+    mx.random.seed(42)
+    model = qwen3_next.Model(
+        qwen3_next.ModelArgs(
+            model_type="qwen3_next",
+            hidden_size=64,
+            num_hidden_layers=8,
+            intermediate_size=128,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            vocab_size=256,
+            linear_num_value_heads=2,
+            linear_num_key_heads=1,
+            linear_key_head_dim=16,
+            linear_value_head_dim=16,
+            linear_conv_kernel_dim=4,
+            num_experts=4,
+            num_experts_per_tok=2,
+            decoder_sparse_step=1,
+            shared_expert_intermediate_size=64,
+            mlp_only_layers=[],
+            moe_intermediate_size=64,
+            rms_norm_eps=1e-6,
+            head_dim=32,
+            rope_theta=10000.0,
+            partial_rotary_factor=0.25,
+            max_position_embeddings=65536,
+        )
+    )
+    mx.eval(model.parameters())
+    prompt = [1, 2, 3, 4, 5, 6, 7, 8]
+    generator = BatchGenerator(model, max_tokens=64)
+    generator.insert([prompt])
+    tokens: list[int] = []
+    set_needs_topk(generator._generation_batch, needs_topk)
+    while responses := generator.next_generated():
+        response = responses[0]
+        tokens.append(response.token)
+        batch = generator._generation_batch
+        if len(tokens) in (32, 60):
+            mx.synchronize(generation_stream)
+            recurrent = [
+                cache for cache in batch.prompt_cache if isinstance(cache, ArraysCache)
+            ]
+            assert len(recurrent) == 6
+            for cache in recurrent:
+                assert cache.left_padding is not None
+                graph = io.StringIO()
+                mx.export_to_dot(graph, cache.left_padding)
+                assert graph.getvalue().count("->") == 0
+                assert cache.left_padding.tolist() == [-len(prompt) - len(tokens)]
+            topk = take_ready_topk(batch).for_uid(response.uid)
+            if needs_topk:
+                assert topk is not None
+                indices, values, selected = topk
+                assert values == sorted(values, reverse=True)
+                assert selected == pytest.approx(
+                    response.logprobs[response.token].item()
+                )
+                assert values == pytest.approx(
+                    response.logprobs[mx.array(indices)].tolist()
+                )
+            else:
+                assert topk is None
+        if response.finish_reason is not None:
+            assert response.finish_reason == "length"
+            assert response.prompt_cache is not None
+    assert len(tokens) == 64
+    assert generator._generation_batch.prompt_cache == []
+    expected = [
+        token for token, _ in generate_step(mx.array(prompt), model, max_tokens=64)
+    ]
+    assert tokens == expected
 
 
 def _init_random(model: nn.Module) -> None:
