@@ -1819,20 +1819,22 @@ class API:
         )
 
     async def add_custom_model(self, payload: AddCustomModelParams) -> ModelListModel:
-        """Fetch a model from HuggingFace and save as a custom model card, then sync across the cluster."""
-        try:
-            card = await ModelCard.fetch_from_hf(payload.model_id)
-        except Exception as exc:
-            raise HTTPException(
-                status_code=400, detail=f"Failed to fetch model: {exc}"
-            ) from exc
+        """Register a built-in card or fetch and synchronize a custom card."""
+        card = await model_cards.load_builtin_model_card(payload.model_id)
+        if card is None:
+            try:
+                card = await ModelCard.fetch_from_hf(payload.model_id)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"Failed to fetch model: {exc}"
+                ) from exc
 
-        await self.command_sender.send(
-            ForwarderCommand(
-                origin=self._system_id,
-                command=AddCustomModelCard(model_card=card),
+            await self.command_sender.send(
+                ForwarderCommand(
+                    origin=self._system_id,
+                    command=AddCustomModelCard(model_card=card),
+                )
             )
-        )
 
         # Immediately update the local cache so the subsequent GET /models
         # returns the new model without waiting for the event round-trip.
@@ -1847,7 +1849,13 @@ class API:
             storage_size_megabytes=int(card.storage_size.in_mb),
             supports_tensor=card.supports_tensor,
             tasks=[task.value for task in card.tasks],
-            is_custom=True,
+            is_custom=card.is_custom,
+            family=card.family,
+            quantization=card.quantization,
+            base_model=card.base_model,
+            capabilities=card.capabilities,
+            reasoning_dialect=card.reasoning_dialect,
+            context_length=card.context_length,
         )
 
     async def delete_custom_model(self, model_id: ModelId) -> JSONResponse:

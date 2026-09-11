@@ -95,6 +95,15 @@ class _CardCache:
 card_cache = _CardCache()
 
 
+async def load_builtin_model_card(model_id: ModelId) -> "ModelCard | None":
+    filename = model_id.normalize() + ".toml"
+    for directory in _BUILTIN_CARD_DIRS:
+        path = directory / filename
+        if await path.exists():
+            return await ModelCard.load_from_path(path)
+    return None
+
+
 def detect_vision_from_config(model_id: ModelId) -> "VisionCardConfig | None":
     normalized = model_id.normalize()
     for model_dir in [d / normalized for d in EXO_MODELS_DIRS]:
