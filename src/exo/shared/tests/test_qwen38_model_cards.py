@@ -1,8 +1,20 @@
 import pytest
 
-from exo.shared.models.model_cards import ModelTask, card_cache
+from exo.shared.models.model_cards import ConfigData, ModelTask, card_cache
 from exo.shared.types.backends import Backend
 from exo.shared.types.common import ModelId
+
+
+def test_qwen4_exp_config_supports_tensor() -> None:
+    config = ConfigData.model_validate(
+        {
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "hidden_size": 4096,
+            "num_hidden_layers": 48,
+        }
+    )
+
+    assert config.supports_tensor
 
 
 @pytest.mark.parametrize(
