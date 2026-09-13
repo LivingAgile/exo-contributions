@@ -57,6 +57,8 @@ from mlx_lm.models.qwen3_next import (
 )
 from mlx_lm.models.qwen3_next import Qwen3NextModel as Qwen3NextInnerModel
 from mlx_lm.models.qwen3_vl import Model as Qwen3VLModel
+from mlx_lm.models.qwen4_exp import Model as Qwen4ExpModel
+from mlx_lm.models.qwen4_exp import SparseMoeBlock as Qwen4ExpSparseMoeBlock
 from mlx_lm.models.step3p5 import Model as Step35Model
 from mlx_lm.models.step3p5 import Step3p5MLP as Step35MLP
 from mlx_lm.models.step3p5 import Step3p5Model as Step35InnerModel
@@ -539,6 +541,14 @@ def tensor_auto_parallel(
         )
     elif isinstance(model, Glm4MoeModel):
         tensor_parallel_sharding_strategy = Glm4MoeShardingStrategy(
+            group,
+            all_to_sharded_linear,
+            sharded_to_all_linear,
+            all_to_sharded_linear_in_place,
+            sharded_to_all_linear_in_place,
+        )
+    elif isinstance(model, Qwen4ExpModel):
+        tensor_parallel_sharding_strategy = Qwen4ExpShardingStrategy(
             group,
             all_to_sharded_linear,
             sharded_to_all_linear,
@@ -1279,6 +1289,32 @@ class QwenShardingStrategy(TensorParallelShardingStrategy):
             mx.eval(layer)
             mx.clear_cache()
 
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
+        return model
+
+
+class Qwen4ExpShardingStrategy(TensorParallelShardingStrategy):
+    def shard_model(
+        self,
+        model: nn.Module,
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
+        model = cast(Qwen4ExpModel, model)
+        total = len(model.layers)
+        for i, layer in enumerate(model.layers):
+            mx.eval(layer.parameters())
+
+            assert isinstance(layer.mlp, Qwen4ExpSparseMoeBlock)
+            self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.gate_proj)
+            self.sharded_to_all_linear_in_place(layer.mlp.switch_mlp.down_proj)
+            self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.up_proj)
+            self.all_to_sharded_linear_in_place(layer.mlp.shared_expert.gate_proj)
+            self.sharded_to_all_linear_in_place(layer.mlp.shared_expert.down_proj)
+            self.all_to_sharded_linear_in_place(layer.mlp.shared_expert.up_proj)
+            layer.mlp = ShardedMoE(layer.mlp)  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
+            layer.mlp.sharding_group = self.group
+
+            mx.eval(layer)
+            mx.clear_cache()
             yield ModelLoadingResponse(layers_loaded=i, total=total)
         return model
 

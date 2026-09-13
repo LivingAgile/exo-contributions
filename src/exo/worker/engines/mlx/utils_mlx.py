@@ -147,6 +147,20 @@ def mlx_distributed_init(
         return group
 
 
+def load_model_for_exo(model_path: Path) -> tuple[nn.Module, dict[str, Any]]:
+    config = cast(
+        dict[str, Any], json.loads((model_path / "config.json").read_text())
+    )
+    if config.get("model_type") == "qwen4_exp":
+        return load_model(
+            model_path,
+            lazy=True,
+            strict=True,
+            model_config={"model_file": None},
+        )
+    return load_model(model_path, lazy=True, strict=False)
+
+
 def initialize_mlx(
     bound_instance: BoundInstance,
 ) -> mx.distributed.Group:
@@ -172,7 +186,7 @@ def load_mlx_items(
         logger.info(f"Single device used for {bound_instance.instance}")
         model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
         start_time = time.perf_counter()
-        model, _ = load_model(model_path, lazy=True, strict=False)
+        model, _ = load_model_for_exo(model_path)
         # Eval layers one by one for progress reporting
         try:
             inner = get_inner_model(model)
@@ -235,7 +249,7 @@ def shard_and_load(
 ) -> Generator[ModelLoadingResponse, None, tuple[nn.Module, TokenizerWrapper]]:
     model_path = build_model_path(shard_metadata.model_card.model_id)
 
-    model, _ = load_model(model_path, lazy=True, strict=False)
+    model, _ = load_model_for_exo(model_path)
     logger.debug(model)
     if hasattr(model, "model") and isinstance(model.model, DeepseekV3Model):  # type: ignore
         pass
