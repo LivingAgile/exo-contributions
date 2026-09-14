@@ -12,7 +12,12 @@ from exo.master.tests.conftest import (
     create_rdma_connection,
     create_socket_connection,
 )
-from exo.shared.models.model_cards import ModelCard, ModelId, ModelTask
+from exo.shared.models.model_cards import (
+    ModelCard,
+    ModelId,
+    ModelTask,
+    VisionCardConfig,
+)
 from exo.shared.topology import Topology
 from exo.shared.types.backends import Backend
 from exo.shared.types.commands import PlaceInstance
@@ -569,6 +574,72 @@ def _build_three_node_rdma_topology() -> tuple[
         topology.add_connection(Connection(source=src, sink=sink, edge=ethernet_conn))
 
     return topology, node_a, node_b, node_c, node_network
+
+
+def test_place_qwen4_exp_tensor_with_fewer_kv_heads_than_nodes() -> None:
+    topology = Topology()
+    node_ids = [NodeId() for _ in range(4)]
+    node_network = {node_id: create_node_network() for node_id in node_ids}
+
+    for node_id in node_ids:
+        topology.add_node(node_id)
+    for source in node_ids:
+        for sink in node_ids:
+            if source == sink:
+                continue
+            topology.add_connection(
+                Connection(
+                    source=source,
+                    sink=sink,
+                    edge=create_socket_connection(1),
+                )
+            )
+            topology.add_connection(
+                Connection(
+                    source=source,
+                    sink=sink,
+                    edge=create_rdma_connection(3),
+                )
+            )
+
+    model_card = ModelCard(
+        model_id=ModelId("pipenetwork/Qwen3.8-Flash-Next-MLX-8bit"),
+        storage_size=Memory.from_bytes(3200),
+        n_layers=48,
+        hidden_size=2560,
+        supports_tensor=True,
+        num_key_value_heads=2,
+        tasks=[ModelTask.TextGeneration],
+        backends=[Backend.MlxMetal],
+        vision=VisionCardConfig(
+            image_token_id=0,
+            model_type="qwen4_exp",
+            weights_repo="pipenetwork/Qwen3.8-Flash-Next-MLX-8bit",
+        ),
+    )
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=4,
+    )
+    node_memory = {node_id: create_node_memory(1000) for node_id in node_ids}
+    node_rdma_ctl = {node_id: NodeRdmaCtlStatus(enabled=True) for node_id in node_ids}
+
+    placements = place_instance(
+        command,
+        topology,
+        {},
+        node_memory,
+        node_network,
+        _metal_only(node_memory),
+        node_rdma_ctl=node_rdma_ctl,
+    )
+
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxJacclInstance)
+    assert len(instance.shard_assignments.node_to_runner) == 4
 
 
 def test_place_mlx_jaccl_rejects_when_a_node_has_rdma_ctl_disabled(
