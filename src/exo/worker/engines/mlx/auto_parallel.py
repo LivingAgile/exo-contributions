@@ -74,6 +74,30 @@ if TYPE_CHECKING:
 
 _pending_prefill_sends: list[tuple[mx.array, int, mx.distributed.Group]] = []
 
+_GLM_MOE_DSA_FULL_INDEXER_LAYERS = (
+    0,
+    1,
+    2,
+    6,
+    10,
+    14,
+    18,
+    22,
+    26,
+    30,
+    34,
+    38,
+    42,
+    46,
+    50,
+    54,
+    58,
+    62,
+    66,
+    70,
+    74,
+)
+
 
 def flush_prefill_sends() -> None:
     for output, dst, group in _pending_prefill_sends:
@@ -96,6 +120,77 @@ class _LayerCallable(Protocol):
     """
 
     def __call__(self, x: mx.array, *args: object, **kwargs: object) -> mx.array: ...
+
+
+class _GlmNorm(Protocol):
+    eps: float
+
+
+class _GlmHeadBank(Protocol):
+    def apply(self, fn: Callable[[mx.array], mx.array]) -> None: ...
+
+
+class _GlmIndexer(Protocol):
+    wq_b: nn.Module
+    wk: nn.Module
+    k_norm: _GlmNorm
+    weights_proj: nn.Module
+
+
+class _GlmAttention(Protocol):
+    q_a_proj: nn.Module
+    q_b_proj: nn.Module
+    kv_a_proj_with_mqa: nn.Module
+    o_proj: nn.Module
+    embed_q: _GlmHeadBank
+    unembed_out: _GlmHeadBank
+    num_heads: int
+    indexer: _GlmIndexer | None
+
+
+class _GlmProjectionSet(Protocol):
+    gate_proj: nn.Module
+    up_proj: nn.Module
+    down_proj: nn.Module
+
+
+class _GlmGate(Protocol):
+    weight: mx.array
+    e_score_correction_bias: mx.array
+
+
+class _GlmMoe(Protocol):
+    shared_experts: _GlmProjectionSet
+    switch_mlp: _GlmProjectionSet
+    gate: _GlmGate
+    sharding_group: mx.distributed.Group | None
+
+
+class _GlmLayer(Protocol):
+    self_attn: _GlmAttention
+    mlp: nn.Module
+
+
+class _GlmArgs(Protocol):
+    indexer_types: list[str]
+
+
+class _GlmInnerModel(Protocol):
+    embed_tokens: nn.Module
+    layers: list[_GlmLayer]
+    norm: nn.Module
+
+
+class _GlmCacheList(Protocol):
+    caches: list[object]
+
+
+class _GlmModel(Protocol):
+    args: _GlmArgs
+    model: _GlmInnerModel
+    lm_head: nn.Module
+
+    def make_cache(self) -> list[_GlmCacheList]: ...
 
 
 class CustomMlxLayer(nn.Module):
@@ -606,6 +701,14 @@ def tensor_auto_parallel(
             all_to_sharded_linear_in_place,
             sharded_to_all_linear_in_place,
         )
+    elif _is_bundled_glm_moe_dsa(model):
+        tensor_parallel_sharding_strategy = GlmMoeDsaShardingStrategy(
+            group,
+            all_to_sharded_linear,
+            sharded_to_all_linear,
+            all_to_sharded_linear_in_place,
+            sharded_to_all_linear_in_place,
+        )
     else:
         raise ValueError(f"Unsupported model type: {type(model)}")
 
@@ -758,6 +861,178 @@ class DeepSeekShardingStrategy(TensorParallelShardingStrategy):
             mx.eval(layer)
 
             yield ModelLoadingResponse(layers_loaded=i, total=total)
+
+        return model
+
+
+def _is_bundled_glm_moe_dsa(model: nn.Module) -> bool:
+    return (
+        getattr(model, "model_type", None) == "glm_moe_dsa"
+        and type(model).__module__ == "custom_model"
+    )
+
+
+def _require_attributes(value: object, path: str, names: tuple[str, ...]) -> None:
+    missing = [name for name in names if not hasattr(value, name)]
+    if missing:
+        raise ValueError(f"{path} is missing required attributes: {', '.join(missing)}")
+
+
+def _validate_glm_moe_dsa_model(
+    model: nn.Module,
+    world_size: int,
+) -> tuple[list[_GlmLayer], list[bool]]:
+    if not _is_bundled_glm_moe_dsa(model):
+        raise ValueError("GLM DSA Tensor strategy requires bundled custom_model.Model")
+
+    _require_attributes(model, "model", ("args", "model", "lm_head", "make_cache"))
+    custom_model = cast(_GlmModel, cast(object, model))
+    args = custom_model.args
+    inner = custom_model.model
+    _require_attributes(inner, "model.model", ("embed_tokens", "layers", "norm"))
+    layers = list(inner.layers)
+    if len(layers) != 78:
+        raise ValueError(f"glm_moe_dsa requires exactly 78 layers, got {len(layers)}")
+
+    expected_types = [
+        "full" if index in _GLM_MOE_DSA_FULL_INDEXER_LAYERS else "shared"
+        for index in range(78)
+    ]
+    if list(getattr(args, "indexer_types", [])) != expected_types:
+        raise ValueError("glm_moe_dsa indexer_types do not match the 21/57 schedule")
+
+    caches = custom_model.make_cache()
+    if len(caches) != len(layers):
+        raise ValueError("glm_moe_dsa cache count must match its active layer count")
+
+    dense_layers: list[bool] = []
+    projection_names = ("gate_proj", "up_proj", "down_proj")
+    for index, (layer, indexer_type, cache) in enumerate(
+        zip(layers, expected_types, caches, strict=True)
+    ):
+        layer_path = f"model.layers.{index}"
+        _require_attributes(layer, layer_path, ("self_attn", "mlp"))
+        attention = layer.self_attn
+        _require_attributes(
+            attention,
+            f"{layer_path}.self_attn",
+            (
+                "q_a_proj",
+                "q_b_proj",
+                "kv_a_proj_with_mqa",
+                "o_proj",
+                "embed_q",
+                "unembed_out",
+                "num_heads",
+                "indexer",
+            ),
+        )
+        if attention.num_heads % world_size != 0:
+            raise ValueError(
+                f"{layer_path}.self_attn.num_heads must be divisible by {world_size}"
+            )
+
+        if indexer_type == "full":
+            indexer = attention.indexer
+            if indexer is None:
+                raise ValueError(f"full layer {index} must define an indexer")
+            _require_attributes(
+                indexer,
+                f"{layer_path}.self_attn.indexer",
+                ("wq_b", "wk", "k_norm", "weights_proj"),
+            )
+            if indexer.k_norm.eps != 1e-6:
+                raise ValueError(f"full layer {index} indexer k_norm must use eps=1e-6")
+        elif attention.indexer is not None:
+            raise ValueError(f"shared layer {index} must not define an indexer")
+        expected_cache_count = 2 if indexer_type == "full" else 1
+        cache_count = len(getattr(cache, "caches", ()))
+        if cache_count != expected_cache_count:
+            raise ValueError(
+                f"{layer_path} must create {expected_cache_count} cache entries"
+            )
+
+        mlp = layer.mlp
+        is_dense = all(hasattr(mlp, name) for name in projection_names)
+        is_moe = all(
+            hasattr(mlp, name)
+            for name in ("shared_experts", "switch_mlp", "gate", "sharding_group")
+        )
+        expected_dense = index < 3
+        if is_dense != expected_dense or is_moe == expected_dense:
+            expected_kind = "dense" if expected_dense else "MoE"
+            raise ValueError(f"{layer_path}.mlp must have {expected_kind} structure")
+        if is_dense:
+            _require_attributes(mlp, f"{layer_path}.mlp", projection_names)
+        else:
+            moe = cast(_GlmMoe, cast(object, mlp))
+            _require_attributes(
+                moe.shared_experts,
+                f"{layer_path}.mlp.shared_experts",
+                projection_names,
+            )
+            _require_attributes(
+                moe.switch_mlp,
+                f"{layer_path}.mlp.switch_mlp",
+                projection_names,
+            )
+            _require_attributes(
+                moe.gate,
+                f"{layer_path}.mlp.gate",
+                ("weight", "e_score_correction_bias"),
+            )
+        dense_layers.append(is_dense)
+
+    return layers, dense_layers
+
+
+class GlmMoeDsaShardingStrategy(TensorParallelShardingStrategy):
+    def shard_model(
+        self,
+        model: nn.Module,
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
+        layers, dense_layers = _validate_glm_moe_dsa_model(model, self.N)
+        total = len(layers)
+        for index, (layer, is_dense) in enumerate(
+            zip(layers, dense_layers, strict=True)
+        ):
+            layer_module = cast(nn.Module, cast(object, layer))
+            mx.eval(layer_module.parameters())
+            attention = layer.self_attn
+            attention.q_b_proj = self.all_to_sharded_linear(attention.q_b_proj)
+            attention.o_proj = self.sharded_to_all_linear(attention.o_proj)
+            attention.num_heads //= self.N
+            start_head = self.group.rank() * attention.num_heads
+            end_head = start_head + attention.num_heads
+
+            def shard_heads(
+                weight: mx.array,
+                start: int = start_head,
+                end: int = end_head,
+            ) -> mx.array:
+                return weight[start:end]
+
+            attention.embed_q.apply(shard_heads)
+            attention.unembed_out.apply(shard_heads)
+
+            if is_dense:
+                mlp = cast(_GlmProjectionSet, cast(object, layer.mlp))
+                mlp.gate_proj = self.all_to_sharded_linear(mlp.gate_proj)
+                mlp.down_proj = self.sharded_to_all_linear(mlp.down_proj)
+                mlp.up_proj = self.all_to_sharded_linear(mlp.up_proj)
+            else:
+                mlp = cast(_GlmMoe, cast(object, layer.mlp))
+                self.all_to_sharded_linear_in_place(mlp.shared_experts.gate_proj)
+                self.sharded_to_all_linear_in_place(mlp.shared_experts.down_proj)
+                self.all_to_sharded_linear_in_place(mlp.shared_experts.up_proj)
+                self.all_to_sharded_linear_in_place(mlp.switch_mlp.gate_proj)
+                self.sharded_to_all_linear_in_place(mlp.switch_mlp.down_proj)
+                self.all_to_sharded_linear_in_place(mlp.switch_mlp.up_proj)
+                mlp.sharding_group = self.group
+
+            mx.eval(layer_module)
+            mx.clear_cache()
+            yield ModelLoadingResponse(layers_loaded=index, total=total)
 
         return model
 

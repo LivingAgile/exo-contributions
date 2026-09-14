@@ -148,9 +148,7 @@ def mlx_distributed_init(
 
 
 def load_model_for_exo(model_path: Path) -> tuple[nn.Module, dict[str, Any]]:
-    config = cast(
-        dict[str, Any], json.loads((model_path / "config.json").read_text())
-    )
+    config = cast(dict[str, Any], json.loads((model_path / "config.json").read_text()))
     if config.get("model_type") == "qwen4_exp":
         return load_model(
             model_path,
@@ -158,6 +156,10 @@ def load_model_for_exo(model_path: Path) -> tuple[nn.Module, dict[str, Any]]:
             strict=True,
             model_config={"model_file": None},
         )
+    if config.get("model_type") == "glm_moe_dsa":
+        if config.get("model_file") != "glm_moe_dsa.py":
+            raise ValueError("glm_moe_dsa requires the bundled glm_moe_dsa.py runtime")
+        return load_model(model_path, lazy=True, strict=True)
     return load_model(model_path, lazy=True, strict=False)
 
 
