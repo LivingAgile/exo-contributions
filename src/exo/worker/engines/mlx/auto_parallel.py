@@ -62,6 +62,7 @@ from mlx_lm.models.qwen4_exp import SparseMoeBlock as Qwen4ExpSparseMoeBlock
 from mlx_lm.models.step3p5 import Model as Step35Model
 from mlx_lm.models.step3p5 import Step3p5MLP as Step35MLP
 from mlx_lm.models.step3p5 import Step3p5Model as Step35InnerModel
+from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
 from exo.shared.types.worker.runner_response import ModelLoadingResponse
 from exo.shared.types.worker.shards import PipelineShardMetadata
@@ -1300,14 +1301,15 @@ class Qwen4ExpShardingStrategy(TensorParallelShardingStrategy):
         down_proj: nn.Module,
         up_proj: nn.Module,
     ) -> None:
-        if not isinstance(down_proj, nn.QuantizedLinear):
+        quantized_linear_types = (nn.QuantizedLinear, QuantizedSwitchLinear)
+        if not isinstance(down_proj, quantized_linear_types):
             self.all_to_sharded_linear_in_place(gate_proj)
             self.sharded_to_all_linear_in_place(down_proj)
             self.all_to_sharded_linear_in_place(up_proj)
             return
 
-        if not isinstance(gate_proj, nn.QuantizedLinear) or not isinstance(
-            up_proj, nn.QuantizedLinear
+        if not isinstance(gate_proj, quantized_linear_types) or not isinstance(
+            up_proj, quantized_linear_types
         ):
             raise TypeError("Qwen4Exp MoE projections must share quantization")
 

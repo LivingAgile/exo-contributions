@@ -403,6 +403,7 @@ def _build(name, seed=0):
     import mlx.core as mx
     import mlx.nn as nn
     from mlx.utils import tree_map_with_path
+    from mlx_lm.models.switch_layers import SwitchLinear
 
     import exo.worker.engines.mlx.auto_parallel  # noqa: F401
 
@@ -426,7 +427,7 @@ def _build(name, seed=0):
         if cfg.get("quantize_moe_only"):
 
             def class_predicate(path, module):
-                return isinstance(module, nn.Linear) and (
+                return isinstance(module, (nn.Linear, SwitchLinear)) and (
                     ".mlp.switch_mlp" in path or ".mlp.shared_expert." in path
                 )
 
