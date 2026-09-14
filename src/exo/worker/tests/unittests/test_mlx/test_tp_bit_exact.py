@@ -56,6 +56,51 @@ MODEL_CONFIGS = {
             },
         },
     },
+    "qwen4_exp_q8_uneven": {
+        "module": "mlx_lm.models.qwen4_exp",
+        "quantize": dict(group_size=64, bits=8, mode="affine"),
+        "quantize_moe_only": True,
+        "args": {
+            "model_type": "qwen4_exp",
+            "text_config": {
+                "hidden_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 32,
+                "vocab_size": 512,
+                "rms_norm_eps": 1e-6,
+                "full_attention_interval": 2,
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 640,
+                "shared_expert_intermediate_size": 640,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 4,
+                "linear_key_head_dim": 16,
+                "linear_value_head_dim": 16,
+                "linear_conv_kernel_dim": 4,
+                "hc_count": 4,
+                "hc_lowrank": 16,
+                "indexer_n_heads": 2,
+                "indexer_kv_heads": 1,
+                "indexer_head_dim": 16,
+                "indexer_budget": 8,
+                "indexer_compress_ratio": 4,
+                "ngram_size": 3,
+                "heads_per_ngram": 2,
+                "ngram_vocab_size_base": 101,
+                "split_ngram_parts": 4,
+                "ple_embed_dim": 64,
+                "ple_layer_ids": [1],
+                "eos_token_id": 1,
+                "rope_parameters": {
+                    "rope_theta": 10000000,
+                    "partial_rotary_factor": 0.25,
+                },
+            },
+        },
+    },
     "llama": dict(
         module="mlx_lm.models.llama",
         args=dict(
@@ -377,7 +422,15 @@ def _build(name, seed=0):
 
     m.update(tree_map_with_path(_to_bf16, m.parameters()))
     if "quantize" in cfg:
-        nn.quantize(m, **cfg["quantize"])
+        class_predicate = None
+        if cfg.get("quantize_moe_only"):
+
+            def class_predicate(path, module):
+                return isinstance(module, nn.Linear) and (
+                    ".mlp.switch_mlp" in path or ".mlp.shared_expert." in path
+                )
+
+        nn.quantize(m, **cfg["quantize"], class_predicate=class_predicate)
     mx.eval(m.parameters())
     return mx, m
 
@@ -399,7 +452,7 @@ def _run(name, out_path, shard, seed=0):
                 m = completed.value
                 break
         mx_.eval(m.parameters())
-    if name == "qwen4_exp":
+    if name.startswith("qwen4_exp"):
         rows = [
             mx_.array([[1, 23, 45, 67, 89, 12, 34]], dtype=mx_.int32),
             mx_.array([[1, 23, 45, 67, 89]], dtype=mx_.int32),
@@ -493,15 +546,25 @@ pytestmark = [
 ]
 
 
-@pytest.mark.parametrize(
-    ("seed", "port_base"), [(0, 31980), (17, 31984), (43, 31988)]
-)
+@pytest.mark.parametrize(("seed", "port_base"), [(0, 31980), (17, 31984), (43, 31988)])
 def test_qwen4_exp_tp_numerical_parity(seed, port_base):
     max_diff, p99_diff, mean_diff, _ = _run_compare(
         "qwen4_exp",
         4,
         port_base,
         seed=seed,
+        atol=_QWEN4_EXP_MAX_ABS_DIFF,
+    )
+    assert max_diff <= _QWEN4_EXP_MAX_ABS_DIFF
+    assert p99_diff <= _QWEN4_EXP_MAX_ABS_DIFF
+    assert mean_diff <= _QWEN4_EXP_MAX_MEAN_DIFF
+
+
+def test_qwen4_exp_q8_uneven_groups_tp_numerical_parity():
+    max_diff, p99_diff, mean_diff, _ = _run_compare(
+        "qwen4_exp_q8_uneven",
+        4,
+        31992,
         atol=_QWEN4_EXP_MAX_ABS_DIFF,
     )
     assert max_diff <= _QWEN4_EXP_MAX_ABS_DIFF

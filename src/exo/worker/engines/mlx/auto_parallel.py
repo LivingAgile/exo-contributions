@@ -1294,6 +1294,75 @@ class QwenShardingStrategy(TensorParallelShardingStrategy):
 
 
 class Qwen4ExpShardingStrategy(TensorParallelShardingStrategy):
+    def _shard_mlp(
+        self,
+        gate_proj: nn.Module,
+        down_proj: nn.Module,
+        up_proj: nn.Module,
+    ) -> None:
+        if not isinstance(down_proj, nn.QuantizedLinear):
+            self.all_to_sharded_linear_in_place(gate_proj)
+            self.sharded_to_all_linear_in_place(down_proj)
+            self.all_to_sharded_linear_in_place(up_proj)
+            return
+
+        if not isinstance(gate_proj, nn.QuantizedLinear) or not isinstance(
+            up_proj, nn.QuantizedLinear
+        ):
+            raise TypeError("Qwen4Exp MoE projections must share quantization")
+
+        down_scales = cast(mx.array, down_proj.scales)
+        quantization_groups: int = down_scales.shape[-1]
+        if quantization_groups % self.N == 0:
+            self.all_to_sharded_linear_in_place(gate_proj)
+            self.sharded_to_all_linear_in_place(down_proj)
+            self.all_to_sharded_linear_in_place(up_proj)
+            return
+
+        if quantization_groups < self.N:
+            raise ValueError(
+                "Qwen4Exp quantized MoE has fewer quantization groups than ranks"
+            )
+
+        groups_per_rank, extra_groups = divmod(quantization_groups, self.N)
+        rank = self.group.rank()
+        group_start = rank * groups_per_rank + min(rank, extra_groups)
+        group_count = groups_per_rank + int(rank < extra_groups)
+        group_end = group_start + group_count
+        group_size = cast(int, down_proj.group_size)
+        bits = cast(int, down_proj.bits)
+        logical_start = group_start * group_size
+        logical_end = group_end * group_size
+        packed_per_group = group_size * bits // 32
+        packed_start = group_start * packed_per_group
+        packed_end = group_end * packed_per_group
+
+        for projection in (gate_proj, up_proj):
+            weight = cast(mx.array, projection.weight)
+            scales = cast(mx.array, projection.scales)
+            projection.weight = mx.contiguous(weight[..., logical_start:logical_end, :])
+            projection.scales = mx.contiguous(scales[..., logical_start:logical_end, :])
+            projection_biases = projection.get("biases")
+            if isinstance(projection_biases, mx.array):
+                projection.biases = mx.contiguous(
+                    projection_biases[..., logical_start:logical_end, :]
+                )
+            projection_bias = projection.get("bias")
+            if isinstance(projection_bias, mx.array):
+                projection.bias = mx.contiguous(
+                    projection_bias[..., logical_start:logical_end]
+                )
+
+        down_weight = cast(mx.array, down_proj.weight)
+        down_proj.weight = mx.contiguous(down_weight[..., packed_start:packed_end])
+        down_proj.scales = mx.contiguous(down_scales[..., group_start:group_end])
+        down_biases = down_proj.get("biases")
+        if isinstance(down_biases, mx.array):
+            down_proj.biases = mx.contiguous(down_biases[..., group_start:group_end])
+        down_bias = down_proj.get("bias")
+        if isinstance(down_bias, mx.array):
+            down_proj.bias = down_bias / self.N
+
     def shard_model(
         self,
         model: nn.Module,
@@ -1304,12 +1373,16 @@ class Qwen4ExpShardingStrategy(TensorParallelShardingStrategy):
             mx.eval(layer.parameters())
 
             assert isinstance(layer.mlp, Qwen4ExpSparseMoeBlock)
-            self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.gate_proj)
-            self.sharded_to_all_linear_in_place(layer.mlp.switch_mlp.down_proj)
-            self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.up_proj)
-            self.all_to_sharded_linear_in_place(layer.mlp.shared_expert.gate_proj)
-            self.sharded_to_all_linear_in_place(layer.mlp.shared_expert.down_proj)
-            self.all_to_sharded_linear_in_place(layer.mlp.shared_expert.up_proj)
+            self._shard_mlp(
+                layer.mlp.switch_mlp.gate_proj,
+                layer.mlp.switch_mlp.down_proj,
+                layer.mlp.switch_mlp.up_proj,
+            )
+            self._shard_mlp(
+                layer.mlp.shared_expert.gate_proj,
+                layer.mlp.shared_expert.down_proj,
+                layer.mlp.shared_expert.up_proj,
+            )
             layer.mlp = ShardedMoE(layer.mlp)  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
             layer.mlp.sharding_group = self.group
 
