@@ -84,6 +84,13 @@ def test_plain_text_passes_through_and_state_is_per_request():
     assert second[0].finish_reason == "stop"
 
 
+def test_plain_text_with_empty_terminal_chunk_stops_normally():
+    results = _collect(["plain answer", ""])
+
+    assert "".join(item.text for item in results) == "plain answer"
+    assert results[-1].finish_reason == "stop"
+
+
 def test_reasoning_and_visible_content_survive_every_character_split():
     output = "to=self<|message|>private plan<|eom|>to=user<|message|>public answer<|eot|>"
 
