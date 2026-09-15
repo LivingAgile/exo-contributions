@@ -124,6 +124,7 @@ _ATEM_CHANNEL_PATTERN = re.compile(
     r"to=([A-Za-z0-9_.\-*]+)<\|message\|>(.*?)<\|(eom|eot)\|>",
     re.DOTALL,
 )
+_MUSE_EOT_TOKEN_ID = 200008
 
 
 def parse_atem_output(
@@ -196,6 +197,8 @@ def _parse_complete_atem(
         "<|eom|><|start|>assistant to=",
         "<|eom|>to=",
     )
+    if terminal.token == _MUSE_EOT_TOKEN_ID and not text.endswith("<|eot|>"):
+        text += "<|eot|>"
     position = 0
     reasoning: list[str] = []
     terminal_result: GenerationResponse | ToolCallResponse | None = None

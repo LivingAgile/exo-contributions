@@ -340,6 +340,14 @@ async def test_kimi_tokenizer_specifically():
     assert eos_token_ids == [163586], "Kimi EOS token should be [163586]"
 
 
+def test_muse_glimmer_uses_protocol_end_as_eos():
+    eos_token_ids = get_eos_token_ids_for_model(
+        ModelId("meta-models/Muse-Glimmer-30B")
+    )
+
+    assert eos_token_ids == [200001, 200008]
+
+
 # Test GLM tokenizer since it also has special handling
 @pytest.mark.asyncio
 async def test_glm_tokenizer_specifically():

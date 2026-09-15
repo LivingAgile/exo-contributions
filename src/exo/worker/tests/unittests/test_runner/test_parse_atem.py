@@ -117,6 +117,35 @@ def test_actual_muse_assistant_framing_is_parsed():
     assert generated[-1].finish_reason == "stop"
 
 
+def test_muse_eot_stop_token_is_restored_for_parsing():
+    responses = iter(
+        [
+            GenerationResponse(
+                text=(
+                    "to=self<|message|>private plan<|eom|>"
+                    "<|start|>assistant to=user<|message|>126"
+                ),
+                token=0,
+                finish_reason=None,
+                usage=None,
+            ),
+            GenerationResponse(
+                text="",
+                token=200008,
+                finish_reason="stop",
+                usage=None,
+            ),
+        ]
+    )
+
+    results = list(parse_atem_output(responses, TOOLS))
+    generated = [item for item in results if isinstance(item, GenerationResponse)]
+
+    assert "".join(item.text for item in generated if item.is_thinking) == "private plan"
+    assert "".join(item.text for item in generated if not item.is_thinking) == "126"
+    assert generated[-1].finish_reason == "stop"
+
+
 def test_apply_all_parsers_routes_muse_tool_calls_to_structured_chunk():
     body = (
         "to=weather<|message|><atem:function_calls>"
