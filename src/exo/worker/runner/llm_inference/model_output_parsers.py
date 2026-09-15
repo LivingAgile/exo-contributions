@@ -147,21 +147,27 @@ def parse_atem_output(
                 return
             continue
 
+        candidate = response.text.lstrip(" ")
         if not pending and not (
-            response.text.startswith("to=") or "to=".startswith(response.text)
+            candidate == ""
+            or candidate.startswith("to=")
+            or "to=".startswith(candidate)
         ):
             yield response
             continue
 
         pending.append(response)
         combined = "".join(item.text for item in pending)
-        if combined.startswith("to="):
+        candidate = combined.lstrip(" ")
+        if candidate.startswith("to="):
             protocol_mode = True
             if response.finish_reason is not None:
                 yield from _parse_complete_atem(pending, tools)
                 return
             continue
-        if combined and "to=".startswith(combined):
+        if candidate == "" and response.finish_reason is None:
+            continue
+        if candidate and "to=".startswith(candidate):
             if response.finish_reason is not None:
                 yield _atem_error(response)
                 return
@@ -185,7 +191,11 @@ def _parse_complete_atem(
         yield _atem_error(terminal)
         return
 
-    text = "".join(item.text for item in responses)
+    text = "".join(item.text for item in responses).lstrip(" ")
+    text = text.replace(
+        "<|eom|><|start|>assistant to=",
+        "<|eom|>to=",
+    )
     position = 0
     reasoning: list[str] = []
     terminal_result: GenerationResponse | ToolCallResponse | None = None
