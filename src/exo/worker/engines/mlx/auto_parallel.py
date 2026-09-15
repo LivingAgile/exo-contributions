@@ -5,8 +5,10 @@ from inspect import signature
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import mlx.core as mx
-import mlx.nn as nn
+from mlx import nn
 from mlx.nn.layers.distributed import (
+    AllToShardedLinear,
+    ShardedToAllLinear,
     shard_inplace,
     shard_linear,
     sum_gradients,
@@ -33,6 +35,7 @@ from mlx_lm.models.llama import Model as LlamaModel
 from mlx_lm.models.minimax import MiniMaxAttention
 from mlx_lm.models.minimax import Model as MiniMaxModel
 from mlx_lm.models.ministral3 import Model as Ministral3Model
+from mlx_lm.models.muse_glimmer import Model as MuseGlimmerModel
 from mlx_lm.models.nemotron_h import Model as NemotronHModel
 from mlx_lm.models.nemotron_h import (
     NemotronHAttention,
@@ -603,6 +606,14 @@ def tensor_auto_parallel(
             all_to_sharded_linear_in_place,
             sharded_to_all_linear_in_place,
         )
+    elif isinstance(model, MuseGlimmerModel):
+        tensor_parallel_sharding_strategy = MuseGlimmerShardingStrategy(
+            group,
+            all_to_sharded_linear,
+            sharded_to_all_linear,
+            all_to_sharded_linear_in_place,
+            sharded_to_all_linear_in_place,
+        )
     elif isinstance(model, (DeepseekV3Model, DeepseekV32Model, KimiK25Model)):
         tensor_parallel_sharding_strategy = DeepSeekShardingStrategy(
             group,
@@ -763,6 +774,111 @@ class LlamaShardingStrategy(TensorParallelShardingStrategy):
             mx.eval(layer)
 
             yield ModelLoadingResponse(layers_loaded=i, total=total)
+        return model
+
+
+def _shard_muse_attention_heads(
+    attention: nn.Module,
+    group: mx.distributed.Group,
+) -> None:
+    n_heads = attention.n_heads  # type: ignore
+    n_kv_heads = attention.n_kv_heads  # type: ignore
+    head_dim = attention.head_dim  # type: ignore
+    world_size = group.size()
+    rank = group.rank()
+
+    if n_heads % n_kv_heads != 0:
+        raise ValueError("Muse query heads must be divisible by KV heads")
+    heads_per_kv = n_heads // n_kv_heads
+    if heads_per_kv % world_size != 0:
+        raise ValueError(
+            f"Muse query heads per KV group ({heads_per_kv}) must be divisible "
+            f"by world size ({world_size})"
+        )
+
+    heads_per_rank = heads_per_kv // world_size
+    start = rank * heads_per_rank
+    end = start + heads_per_rank
+
+    def shard_rows(linear: nn.Module) -> AllToShardedLinear:
+        if not isinstance(linear, nn.Linear):
+            raise TypeError("Muse BF16 attention requires dense linear projections")
+        output_dims, input_dims = linear.weight.shape
+        expected_output_dims = n_heads * head_dim
+        if output_dims != expected_output_dims:
+            raise ValueError(
+                f"Muse attention projection output must be {expected_output_dims}, "
+                f"got {output_dims}"
+            )
+        weight = (
+            linear.weight.reshape(n_kv_heads, heads_per_kv, head_dim, input_dims)[
+                :, start:end
+            ]
+            .reshape(n_kv_heads * heads_per_rank * head_dim, input_dims)
+        )
+        sharded = AllToShardedLinear(
+            input_dims,
+            output_dims,
+            bias="bias" in linear,
+            group=group,
+        )
+        sharded.weight = mx.contiguous(weight)
+        if "bias" in linear:
+            sharded.bias = mx.contiguous(
+                linear.bias.reshape(n_kv_heads, heads_per_kv, head_dim)[
+                    :, start:end
+                ].reshape(-1)
+            )
+        return sharded
+
+    def shard_columns(linear: nn.Module) -> ShardedToAllLinear:
+        if not isinstance(linear, nn.Linear):
+            raise TypeError("Muse BF16 attention requires dense linear projections")
+        output_dims, input_dims = linear.weight.shape
+        expected_input_dims = n_heads * head_dim
+        if input_dims != expected_input_dims:
+            raise ValueError(
+                f"Muse attention output input must be {expected_input_dims}, "
+                f"got {input_dims}"
+            )
+        weight = (
+            linear.weight.reshape(output_dims, n_kv_heads, heads_per_kv, head_dim)[
+                :, :, start:end
+            ].reshape(output_dims, n_kv_heads * heads_per_rank * head_dim)
+        )
+        sharded = ShardedToAllLinear(
+            input_dims,
+            output_dims,
+            bias="bias" in linear,
+            group=group,
+        )
+        sharded.weight = mx.contiguous(weight)
+        if "bias" in linear:
+            sharded.bias = linear.bias
+        return sharded
+
+    attention.q_proj = shard_rows(attention.q_proj)  # type: ignore
+    attention.gate_proj = shard_rows(attention.gate_proj)  # type: ignore
+    attention.o_proj = shard_columns(attention.o_proj)  # type: ignore
+    attention.n_heads = n_kv_heads * heads_per_rank  # type: ignore
+
+
+class MuseGlimmerShardingStrategy(TensorParallelShardingStrategy):
+    def shard_model(
+        self,
+        model: nn.Module,
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
+        model = cast(MuseGlimmerModel, model)
+        total = len(model.layers)
+        for index, layer in enumerate(model.layers):
+            mx.eval(layer.parameters())
+            _shard_muse_attention_heads(layer.self_attn, self.group)
+            layer.mlp.gate_proj = self.all_to_sharded_linear(layer.mlp.gate_proj)
+            layer.mlp.down_proj = self.sharded_to_all_linear(layer.mlp.down_proj)
+            layer.mlp.up_proj = self.all_to_sharded_linear(layer.mlp.up_proj)
+            mx.eval(layer)
+            mx.clear_cache()
+            yield ModelLoadingResponse(layers_loaded=index, total=total)
         return model
 
 

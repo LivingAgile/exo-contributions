@@ -117,6 +117,27 @@ MODEL_CONFIGS = {
             rope_theta=10000.0,
         ),
     ),
+    "muse_glimmer": {
+        "module": "mlx_lm.models.muse_glimmer",
+        "args": {
+            "model_type": "muse_glimmer",
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "vocab_size": 512,
+            "sliding_window": 8,
+            "layer_types": [
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            "rope_theta": 100.0,
+        },
+    },
     "qwen3_5_moe": dict(
         module="mlx_lm.models.qwen3_5_moe",
         args=dict(
@@ -401,7 +422,7 @@ _QWEN4_EXP_MAX_MEAN_DIFF = 0.001
 
 def _build(name, seed=0):
     import mlx.core as mx
-    import mlx.nn as nn
+    from mlx import nn
     from mlx.utils import tree_map_with_path
     from mlx_lm.models.switch_layers import SwitchLinear
 
@@ -442,10 +463,27 @@ def _run(name, out_path, shard, seed=0):
     if shard:
         g = mx.distributed.init(backend="ring", strict=True)
     mx_, m = _build(name, seed)
+    muse_kv_weights = None
+    muse_attention_weights = None
+    if name == "muse_glimmer":
+        muse_kv_weights = [
+            (
+                np.asarray(layer.self_attn.k_proj.weight.astype(mx.float32)),
+                np.asarray(layer.self_attn.v_proj.weight.astype(mx.float32)),
+            )
+            for layer in m.layers
+        ]
+        muse_attention_weights = [
+            (
+                np.asarray(layer.self_attn.q_proj.weight.astype(mx.float32)),
+                np.asarray(layer.self_attn.gate_proj.weight.astype(mx.float32)),
+            )
+            for layer in m.layers
+        ]
     if shard:
-        from exo.worker.engines.mlx.auto_parallel import tensor_auto_parallel
+        from exo.worker.engines.mlx import auto_parallel
 
-        loader = tensor_auto_parallel(m, g)
+        loader = auto_parallel.tensor_auto_parallel(m, g)
         while True:
             try:
                 next(loader)
@@ -453,6 +491,38 @@ def _run(name, out_path, shard, seed=0):
                 m = completed.value
                 break
         mx_.eval(m.parameters())
+        if muse_kv_weights is not None:
+            for layer, (key_weight, value_weight) in zip(
+                m.layers, muse_kv_weights, strict=True
+            ):
+                np.testing.assert_array_equal(
+                    np.asarray(layer.self_attn.k_proj.weight.astype(mx.float32)),
+                    key_weight,
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(layer.self_attn.v_proj.weight.astype(mx.float32)),
+                    value_weight,
+                )
+        if muse_attention_weights is not None:
+            n_kv_heads = 2
+            heads_per_kv = 4
+            head_dim = 16
+            heads_per_rank = heads_per_kv // g.size()
+            start = g.rank() * heads_per_rank
+            end = start + heads_per_rank
+            for layer, (query_weight, gate_weight) in zip(
+                m.layers, muse_attention_weights, strict=True
+            ):
+                for projection, source in (
+                    (layer.self_attn.q_proj, query_weight),
+                    (layer.self_attn.gate_proj, gate_weight),
+                ):
+                    expected = source.reshape(
+                        n_kv_heads, heads_per_kv, head_dim, -1
+                    )[:, start:end].reshape(projection.weight.shape)
+                    np.testing.assert_array_equal(
+                        np.asarray(projection.weight.astype(mx.float32)), expected
+                    )
     if name.startswith("qwen4_exp"):
         rows = [
             mx_.array([[1, 23, 45, 67, 89, 12, 34]], dtype=mx_.int32),
@@ -465,6 +535,12 @@ def _run(name, out_path, shard, seed=0):
             items[0].merge(list(items)) for items in zip(*caches, strict=True)
         ]
         logits = m(mx_.array([[56], [56]], dtype=mx_.int32), cache=batch_cache)
+    elif name == "muse_glimmer":
+        inputs = mx_.array(_PROMPT, dtype=mx_.int32)
+        cache = m.make_cache()
+        prefill = m(inputs[:, :-1], cache=cache)
+        decode = m(inputs[:, -1:], cache=cache)
+        logits = mx_.concatenate([prefill, decode], axis=1)
     else:
         inputs = mx_.array(_PROMPT, dtype=mx_.int32)
         logits = m(inputs)
@@ -489,6 +565,24 @@ def _tp_worker(name, rank, hf, out_path, q, seed):
         q.put((rank, True, None))
     except BaseException as e:
         q.put((rank, False, f"{e}\n{traceback.format_exc()}"))
+
+
+def _tp_muse_invalid_gqa_worker(rank, hf, q):
+    os.environ["MLX_HOSTFILE"] = hf
+    os.environ["MLX_RANK"] = str(rank)
+    try:
+        import mlx.core as mx
+
+        from exo.worker.engines.mlx.auto_parallel import tensor_auto_parallel
+
+        group = mx.distributed.init(backend="ring", strict=True)
+        _, model = _build("muse_glimmer")
+        for layer in model.layers:
+            layer.self_attn.n_heads = 6
+        next(tensor_auto_parallel(model, group))
+        q.put((rank, True, None))
+    except Exception as error:  # noqa: BLE001 - report child-process failures
+        q.put((rank, False, f"{error}\n{traceback.format_exc()}"))
 
 
 def _run_compare(name, world_size, port_base, *, seed=0, atol=0.0, rtol=0.0):
@@ -571,6 +665,40 @@ def test_qwen4_exp_q8_uneven_groups_tp_numerical_parity():
     assert max_diff <= _QWEN4_EXP_MAX_ABS_DIFF
     assert p99_diff <= _QWEN4_EXP_MAX_ABS_DIFF
     assert mean_diff <= _QWEN4_EXP_MAX_MEAN_DIFF
+
+
+@pytest.mark.parametrize(("world_size", "port_base"), [(2, 31994), (4, 31996)])
+def test_muse_glimmer_tp_prefill_and_cached_decode_parity(world_size, port_base):
+    _run_compare("muse_glimmer", world_size, port_base, atol=0.03)
+
+
+def test_muse_glimmer_rejects_incompatible_gqa_geometry():
+    world_size = 4
+    context = mp.get_context("spawn")
+    queue = context.Queue()
+    hosts = [f"127.0.0.1:{32000 + rank}" for rank in range(world_size)]
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as file:
+        json.dump(hosts, file)
+        hostfile = file.name
+    processes = [
+        context.Process(
+            target=_tp_muse_invalid_gqa_worker,
+            args=(rank, hostfile, queue),
+        )
+        for rank in range(world_size)
+    ]
+    for process in processes:
+        process.start()
+    results = [queue.get(timeout=300) for _ in range(world_size)]
+    for process in processes:
+        process.join(60)
+
+    assert all(not succeeded for _, succeeded, _ in results)
+    assert all(
+        "query heads per kv group (3) must be divisible by world size (4)"
+        in (payload or "").lower()
+        for _, _, payload in results
+    )
 
 
 @pytest.mark.skip("TP=2 is currently very different to TP=1. This test will not pass")
