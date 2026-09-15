@@ -44,6 +44,27 @@ let
         paths = builtins.concatMap (p: [ (lib.getBin p) (lib.getLib p) (lib.getDev p) ]) (cudaLibs ++ [ cudaPackages.cuda_nvcc cuda_cccl_compat ]);
       };
       exoOverlay = final: prev: {
+        "mlx-lm" = prev."mlx-lm".overrideAttrs (old: {
+          postPatch = (old.postPatch or "") + ''
+            install -Dm644 ${../nix/muse-glimmer/mlx_lm/models/muse_glimmer.py} \
+              mlx_lm/models/muse_glimmer.py
+          '';
+        });
+
+        "mlx-vlm" = prev."mlx-vlm".overrideAttrs (old: {
+          postInstall = (old.postInstall or "") + ''
+            install -Dm644 ${../nix/muse-glimmer/mlx_vlm/models/activations.py} \
+              $out/${final.python.sitePackages}/mlx_vlm/models/activations.py
+            install -Dm644 ${../nix/muse-glimmer/mlx_vlm/models/rope_utils.py} \
+              $out/${final.python.sitePackages}/mlx_vlm/models/rope_utils.py
+            install -Dm644 ${../nix/muse-glimmer/mlx_vlm/prompt_utils.py} \
+              $out/${final.python.sitePackages}/mlx_vlm/prompt_utils.py
+            mkdir -p $out/${final.python.sitePackages}/mlx_vlm/models/muse_glimmer
+            cp -R ${../nix/muse-glimmer/mlx_vlm/models/muse_glimmer}/. \
+              $out/${final.python.sitePackages}/mlx_vlm/models/muse_glimmer/
+          '';
+        });
+
         # Replace workspace exo_rs with Nix-built wheel.
         # Preserve passthru so mkVirtualEnv can resolve dependency groups.
         # Copy .pyi stub + py.typed marker so basedpyright can find the types.
