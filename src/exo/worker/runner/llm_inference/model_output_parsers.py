@@ -161,7 +161,10 @@ def parse_atem_output(
                 yield from _parse_complete_atem(pending, tools)
                 return
             continue
-        if "to=".startswith(combined) and response.finish_reason is None:
+        if "to=".startswith(combined):
+            if response.finish_reason is not None:
+                yield _atem_error(response)
+                return
             continue
 
         yield from pending

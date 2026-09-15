@@ -192,6 +192,16 @@ def test_complete_protocol_with_non_stop_finish_reason_fails_closed():
     assert "partial answer" not in results[0].text
 
 
+@pytest.mark.parametrize("prefix", ["t", "to"])
+def test_incomplete_channel_prefix_at_end_of_generation_fails_closed(prefix: str):
+    results = _collect([prefix])
+
+    assert len(results) == 1
+    assert isinstance(results[0], GenerationResponse)
+    assert results[0].finish_reason == "error"
+    assert results[0].text == "Malformed Muse ATEM output"
+
+
 def test_malformed_protocol_maps_to_error_chunk_at_production_boundary():
     chunks = [
         chunk
