@@ -143,7 +143,13 @@ def place_instance(
             command.model_card.vision is not None
             and command.model_card.vision.model_type == "qwen4_exp"
         )
-        uses_replicated_kv_heads = is_deepseek_v4 or is_qwen4_exp
+        is_muse_glimmer = (
+            command.model_card.vision is not None
+            and command.model_card.vision.model_type == "muse_glimmer"
+        )
+        uses_replicated_kv_heads = (
+            is_deepseek_v4 or is_qwen4_exp or is_muse_glimmer
+        )
         kv_heads = command.model_card.num_key_value_heads
         cycles_with_sufficient_memory = [
             cycle
