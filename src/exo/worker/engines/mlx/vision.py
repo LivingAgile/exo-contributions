@@ -18,7 +18,7 @@ import numpy as np
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from mlx_vlm.prompt_utils import get_message_json
 from mlx_vlm.utils import load_image_processor
-from PIL import Image
+from PIL import Image, ImageOps
 from safetensors import safe_open
 from transformers import AutoConfig, AutoImageProcessor, PreTrainedConfig
 
@@ -214,6 +214,119 @@ class VisionResult:
     embeddings: mx.array
     media_regions: list[MediaRegion]
     image_token_id: int
+    token_types: mx.array | None = None
+
+
+class DeepseekV41VisionProcessor:
+    """Use DeepSeek V4.1's integrated vision tower and prompt layout."""
+
+    def __init__(self, model: Model):
+        self._model = model
+        args = getattr(model, "args", None)
+        if args is None or getattr(args, "model_type", None) != "deepseek_v41":
+            raise ValueError("DeepseekV41VisionProcessor requires a deepseek_v41 model")
+        self._config = args.vision_config
+        self._image_token_id = int(args.image_token_id)
+
+    def load(self) -> None:
+        if int(self._config.num_hidden_layers) <= 0:
+            raise ValueError("deepseek_v41 config has no vision tower")
+
+    def _prepare_image(self, image_data: Base64Image):
+        from mlx_lm.models.deepseek_v41 import image_token_types, plan_image_grid
+
+        image = decode_base64_image(image_data)
+        original_bytes = image.tobytes()
+        n_llm_h, n_llm_w, best_height, best_width = plan_image_grid(
+            image.width, image.height, self._config
+        )
+        patch_size = int(self._config.patch_size)
+        n_vit_h = best_height // patch_size
+        n_vit_w = best_width // patch_size
+        max_wh_ratio = self._config.max_wh_ratio
+        if max_wh_ratio is not None and image.width >= max_wh_ratio * image.height:
+            image = image.resize((best_width, best_height))
+        else:
+            image = ImageOps.pad(
+                image, (best_width, best_height), color=(127, 127, 127)
+            )
+        pixels = np.asarray(image, dtype=np.float32).transpose(2, 0, 1) / 255.0
+        pixels = (pixels - 0.5) / 0.5
+        patches = mx.array(pixels, dtype=mx.bfloat16)
+        patches = patches.reshape(3, n_vit_h, patch_size, n_vit_w, patch_size)
+        patches = patches.transpose(1, 3, 0, 2, 4).reshape(
+            n_vit_h * n_vit_w, 3, patch_size, patch_size
+        )
+        return (
+            patches,
+            n_vit_h,
+            n_vit_w,
+            image_token_types(n_llm_h, n_llm_w),
+            hashlib.sha256(original_bytes).hexdigest(),
+        )
+
+    def process(
+        self,
+        images: list[Base64Image],
+        chat_template_messages: list[dict[str, Any]],
+        tokenizer: TokenizerWrapper,
+        model: Model,
+        task_params: TextGenerationTaskParams,
+    ) -> VisionResult:
+        from mlx_lm.models.deepseek_v41 import TEXT, ImageInput
+
+        prompt = render_chat_template(tokenizer, chat_template_messages, task_params)
+        encoded = encode_prompt(tokenizer, prompt)
+        source_tokens = [int(token) for token in encoded.tolist()]
+        if source_tokens.count(self._image_token_id) != len(images):
+            raise ValueError(
+                "deepseek_v41 image placeholder count does not match image count: "
+                f"{source_tokens.count(self._image_token_id)} != {len(images)}"
+            )
+
+        expanded_tokens: list[int] = []
+        token_types: list[int] = []
+        image_inputs: list[ImageInput] = []
+        media_regions: list[MediaRegion] = []
+        image_iter = iter(images)
+        for token in source_tokens:
+            if token != self._image_token_id:
+                expanded_tokens.append(token)
+                token_types.append(TEXT)
+                continue
+            patches, n_vit_h, n_vit_w, types, content_hash = self._prepare_image(
+                next(image_iter)
+            )
+            start = len(expanded_tokens)
+            type_values = [int(value) for value in types.tolist()]
+            expanded_tokens.extend([self._image_token_id] * len(type_values))
+            token_types.extend(type_values)
+            image_inputs.append(ImageInput(start, patches, n_vit_h, n_vit_w, types))
+            media_regions.append(
+                MediaRegion(
+                    content_hash=content_hash,
+                    start_pos=start,
+                    end_pos=start + len(type_values),
+                )
+            )
+
+        prompt_tokens = mx.array(expanded_tokens, dtype=encoded.dtype)
+        runtime = getattr(model, "_runtime", model)
+        embed = getattr(model, "embed", getattr(runtime, "embed", None))
+        if embed is None or not hasattr(runtime, "merge_image_embeddings"):
+            raise ValueError("deepseek_v41 model does not expose integrated vision")
+        embeddings = runtime.merge_image_embeddings(
+            [image_inputs], embed(prompt_tokens[None])
+        )
+        mx.eval(embeddings)
+        return VisionResult(
+            prompt=prompt,
+            prompt_tokens=prompt_tokens,
+            embeddings=embeddings,
+            media_regions=media_regions,
+            image_token_id=self._image_token_id,
+            token_types=mx.array(token_types, dtype=mx.int32),
+        )
 
 
 class VisionEncoder:
@@ -658,7 +771,9 @@ class VisionEncoder:
         with contextlib.suppress(AttributeError):
             patch_embed_weight = self._vision_tower.patch_embedder.input_proj.weight  # type: ignore
         with contextlib.suppress(AttributeError):
-            patch_embed_weight = self._vision_tower.patch_embedder.patch_embedding.weight  # type: ignore
+            patch_embed_weight = (
+                self._vision_tower.patch_embedder.patch_embedding.weight
+            )  # type: ignore
         assert patch_embed_weight is not None, (
             "vision tower has no recognised patch-embedding linear"
         )
@@ -898,10 +1013,13 @@ class VisionProcessor:
         )
 
 
+type VisionProcessorType = VisionProcessor | DeepseekV41VisionProcessor
+
+
 def prepare_vision(
     images: list[Base64Image] | None,
     chat_template_messages: list[dict[str, Any]] | None,
-    vision_processor: VisionProcessor,
+    vision_processor: VisionProcessorType,
     tokenizer: TokenizerWrapper,
     model: Model,
     model_id: ModelId,

@@ -31,6 +31,7 @@ from exo.worker.engines.mlx.cache import (
     KVPrefixCache,
     encode_prompt,
     make_kv_cache,
+    supports_prefix_cache,
 )
 from exo.worker.engines.mlx.constants import DEFAULT_TOP_LOGPROBS, MAX_TOKENS
 from exo.worker.engines.mlx.generator.generate import (
@@ -52,7 +53,7 @@ from exo.worker.engines.mlx.utils_mlx import (
 )
 from exo.worker.engines.mlx.vision import (
     MediaRegion,
-    VisionProcessor,
+    VisionProcessorType,
     VisionResult,
     prepare_vision,
 )
@@ -96,7 +97,7 @@ class ExoBatchGenerator:
     tokenizer: TokenizerWrapper
     group: mx.distributed.Group | None
     kv_prefix_cache: KVPrefixCache | None
-    vision_processor: VisionProcessor | None = None
+    vision_processor: VisionProcessorType | None = None
 
     _mlx_gen: MlxBatchGenerator = field(init=False)
     _active_tasks: dict[int, _EngineTask] = field(default_factory=dict, init=False)
@@ -161,9 +162,10 @@ class ExoBatchGenerator:
         is_exact_hit = False
         prompt_tokens = all_prompt_tokens
 
-        if self.kv_prefix_cache is not None and (
+        use_prefix_cache = supports_prefix_cache(self.model) and (
             not is_bench or task_params.use_prefix_cache
-        ):
+        )
+        if self.kv_prefix_cache is not None and use_prefix_cache:
             cache, remaining_tokens, matched_index, is_exact_hit = (
                 self.kv_prefix_cache.get_kv_cache(
                     self.model, all_prompt_tokens, media_regions=media_regions
@@ -198,13 +200,15 @@ class ExoBatchGenerator:
                 prefix_hit_length,
                 len(prompt_tokens) - 1,
                 image_token_id=vision.image_token_id,
+                token_types=vision.token_types,
             )
             if vision is not None
-            else contextlib.nullcontext()
+            else contextlib.nullcontext(self.model)
         )
         uncached_count = len(prompt_tokens)
         use_remote = (
-            uncached_count > REMOTE_PREFILL_MIN_TOKENS
+            vision is None
+            and uncached_count > REMOTE_PREFILL_MIN_TOKENS
             and task_params.prefill_endpoint is not None
         )
 
@@ -212,7 +216,7 @@ class ExoBatchGenerator:
         _prefill_tokens: int = 0
         cache_snapshots: list[CacheSnapshot] = []
         remote_prefilled = False
-        with vision_ctx:
+        with vision_ctx as prefill_model:
             if use_remote and task_params.prefill_endpoint is not None:
                 try:
                     _prefill_tps, _prefill_tokens, cache_snapshots = remote_prefill(
@@ -232,7 +236,7 @@ class ExoBatchGenerator:
 
             if not remote_prefilled:
                 _prefill_tps, _prefill_tokens, cache_snapshots = prefill(
-                    self.model,
+                    prefill_model,
                     self.tokenizer,
                     sampler,
                     prompt_tokens[:-1],
@@ -264,7 +268,7 @@ class ExoBatchGenerator:
                 c.values = c._trim(trim_size, c.values)
                 c._idx = c.max_size
 
-        if not is_bench or task_params.use_prefix_cache:
+        if use_prefix_cache:
             min_prefix_hit_length = max(
                 1000, system_prompt_token_count(task_params, self.tokenizer)
             )

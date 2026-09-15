@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from exo.worker.engines.mlx.vision import VisionProcessor
+    from exo.worker.engines.mlx.vision import (
+        DeepseekV41VisionProcessor,
+        VisionProcessor,
+    )
 
 # Monkey-patch for transformers 5.x compatibility
 # Kimi's tokenization_kimi.py imports bytes_to_unicode from the old location
@@ -147,8 +150,19 @@ def mlx_distributed_init(
         return group
 
 
-def load_model_for_exo(model_path: Path) -> tuple[nn.Module, dict[str, Any]]:
+def load_model_for_exo(
+    model_path: Path, group: mx.distributed.Group | None = None
+) -> tuple[nn.Module, dict[str, Any]]:
     config = cast(dict[str, Any], json.loads((model_path / "config.json").read_text()))
+    if config.get("model_type") == "deepseek_v41":
+        if group is None:
+            raise ValueError("deepseek_v41 requires a distributed shard group")
+        return load_model(
+            model_path,
+            lazy=True,
+            strict=True,
+            shard_group=group,
+        )
     if config.get("model_type") == "qwen4_exp":
         return load_model(
             model_path,
@@ -180,7 +194,13 @@ def load_mlx_items(
     bound_instance: BoundInstance,
     group: mx.distributed.Group | None,
 ) -> Generator[
-    ModelLoadingResponse, None, tuple[Model, TokenizerWrapper, "VisionProcessor | None"]
+    ModelLoadingResponse,
+    None,
+    tuple[
+        Model,
+        TokenizerWrapper,
+        "DeepseekV41VisionProcessor | VisionProcessor | None",
+    ],
 ]:
     set_wired_limit_for_model(get_weights_size(bound_instance.bound_shard))
 
@@ -220,9 +240,15 @@ def load_mlx_items(
 
     mx.clear_cache()
 
+    model_type = model.__class__.__module__
     vision_config = bound_instance.bound_shard.model_card.vision
 
-    if vision_config is not None:
+    if model_type == "mlx_lm.models.deepseek_v41":
+        from exo.worker.engines.mlx.vision import DeepseekV41VisionProcessor
+
+        vision_processor = DeepseekV41VisionProcessor(cast(Model, model))
+        vision_processor.load()
+    elif vision_config is not None:
         from exo.worker.engines.mlx.vision import VisionProcessor
 
         vision_start_time = time.perf_counter()
@@ -251,7 +277,7 @@ def shard_and_load(
 ) -> Generator[ModelLoadingResponse, None, tuple[nn.Module, TokenizerWrapper]]:
     model_path = build_model_path(shard_metadata.model_card.model_id)
 
-    model, _ = load_model_for_exo(model_path)
+    model, _ = load_model_for_exo(model_path, group)
     logger.debug(model)
     if hasattr(model, "model") and isinstance(model.model, DeepseekV3Model):  # type: ignore
         pass
@@ -505,7 +531,12 @@ def _needs_dsml_encoding(task_params: TextGenerationTaskParams) -> bool:
 
 
 def _needs_v4_encoding(task_params: TextGenerationTaskParams) -> bool:
-    return "deepseek-v4" in task_params.model.lower()
+    return re.search(r"deepseek-v4(?:-|$)", task_params.model.lower()) is not None
+
+
+def _needs_v41_encoding(task_params: TextGenerationTaskParams) -> bool:
+    model = task_params.model.lower()
+    return "deepseek-v4.1" in model or "deepseek_v41" in model
 
 
 def _v4_reasoning_effort(task_params: TextGenerationTaskParams) -> str | None:
@@ -515,6 +546,17 @@ def _v4_reasoning_effort(task_params: TextGenerationTaskParams) -> str | None:
     if effort == "high":
         return "high"
     return None
+
+
+def _v41_reasoning_effort(task_params: TextGenerationTaskParams) -> int | None:
+    effort = task_params.reasoning_effort
+    if effort is None:
+        return None
+    if effort == "xhigh":
+        return 100
+    if effort in ("medium", "high"):
+        return 75
+    return 50
 
 
 def _strip_v4_thinking_markers(content: str) -> str:
@@ -570,6 +612,34 @@ def render_chat_template(
     When chat_template_messages is available (from Chat Completions API),
     uses those directly to preserve tool_calls, thinking, and other fields.
     """
+    if _needs_v41_encoding(task_params):
+        from exo.worker.engines.mlx.vendor.deepseek_v41_encoding import (
+            encode_messages as encode_messages_v41,
+        )
+
+        v41_messages = [dict(message) for message in messages]
+        partial_assistant_content: str | None = None
+        if v41_messages and v41_messages[-1].get("role") == "assistant":
+            partial_assistant_content = cast(str, v41_messages[-1].get("content", ""))
+            v41_messages = v41_messages[:-1]
+        if task_params.tools:
+            if v41_messages and v41_messages[0].get("role") == "system":
+                v41_messages[0]["tools"] = task_params.tools
+            else:
+                v41_messages.insert(
+                    0, {"role": "system", "content": "", "tools": task_params.tools}
+                )
+        prompt = encode_messages_v41(
+            messages=v41_messages,
+            thinking_mode=(
+                "chat" if task_params.enable_thinking is False else "thinking"
+            ),
+            reasoning_effort=_v41_reasoning_effort(task_params),
+        )
+        if partial_assistant_content:
+            prompt += partial_assistant_content
+        return prompt
+
     formatted_messages = consolidate_system_messages(messages)
 
     # For assistant prefilling, append content after templating to avoid a closing turn token.

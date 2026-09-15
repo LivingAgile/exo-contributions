@@ -83,6 +83,31 @@ async def test_add_builtin_deepseek_v4_preserves_card(
 
 
 @pytest.mark.asyncio
+async def test_add_builtin_deepseek_v41_preserves_exact_official_card(
+    monkeypatch: pytest.MonkeyPatch,
+    registration_api: tuple[RegistrationAPI, Receiver[ForwarderCommand]],
+) -> None:
+    monkeypatch.setattr(model_cards.card_cache, "cc", {})
+
+    async def fail_fetch(_model_id: object) -> ModelCard:
+        raise AssertionError("built-in models must not be re-fetched from Hugging Face")
+
+    monkeypatch.setattr(ModelCard, "fetch_from_hf", fail_fetch)
+
+    api, commands = registration_api
+    result = await api.add_custom_model(
+        AddCustomModelParams(model_id=ModelId("deepseek-ai/DeepSeek-V4.1-Flash"))
+    )
+
+    assert result.base_model == "DeepSeek V4.1 Flash"
+    assert result.n_layers == 40
+    assert result.hidden_size == 5120
+    assert result.supports_tensor is True
+    assert result.is_custom is False
+    assert commands.collect() == []
+
+
+@pytest.mark.asyncio
 async def test_add_unknown_model_fetches_and_synchronizes_custom_card(
     monkeypatch: pytest.MonkeyPatch,
     registration_api: tuple[RegistrationAPI, Receiver[ForwarderCommand]],

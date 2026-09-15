@@ -5,6 +5,7 @@ from typing import Any
 
 from mlx_lm.models.deepseek_v4 import Model as DeepseekV4Model
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
+from mlx_lm.models.deepseek_v41 import Model as DeepseekV41Model
 from mlx_lm.models.gpt_oss import Model as GptOssModel
 from mlx_lm.models.muse_glimmer import Model as MuseGlimmerModel
 from mlx_lm.tokenizer_utils import TokenizerWrapper
@@ -94,7 +95,20 @@ def apply_all_parsers(
                 starts_in_thinking=detect_thinking_prompt_suffix(prompt, tokenizer),
             )
         generator = parse_deepseek_v32(generator)
-    elif issubclass(model_type, DeepseekV4Model) and "deepseek-v4" in normalized_id:
+    elif issubclass(model_type, DeepseekV41Model) and (
+        "deepseek-v4.1" in normalized_id or "deepseek_v41" in normalized_id
+    ):
+        if tokenizer.has_thinking:
+            generator = parse_thinking_models(
+                generator,
+                tokenizer.think_start,
+                tokenizer.think_end,
+                starts_in_thinking=detect_thinking_prompt_suffix(prompt, tokenizer),
+            )
+        generator = parse_deepseek_v41(generator)
+    elif issubclass(model_type, DeepseekV4Model) and re.search(
+        r"deepseek-v4(?:-|$)", normalized_id
+    ):
         if tokenizer.has_thinking:
             generator = parse_thinking_models(
                 generator,
@@ -403,6 +417,37 @@ def parse_deepseek_v4(
     start = f"<{dsml_token}tool_calls>"
     end = f"</{dsml_token}tool_calls>"
     return _parse_dsml_stream(responses, start, end, parse_dsml_output)
+
+
+def parse_deepseek_v41(
+    responses: Generator[GenerationResponse | None],
+) -> Generator[GenerationResponse | ToolCallResponse | None]:
+    dsml_token = "｜DSML｜"
+    start = f"<{dsml_token} calls>"
+    end = f"</{dsml_token} calls>"
+    return _parse_dsml_stream(responses, start, end, _parse_deepseek_v41_dsml)
+
+
+def _parse_deepseek_v41_dsml(text: str) -> list[ToolCallItem] | None:
+    from exo.worker.engines.mlx.vendor.deepseek_v41_encoding import (
+        eos_token,
+        parse_message_from_completion_text,
+    )
+
+    parsed = parse_message_from_completion_text(
+        "\n\n" + text + eos_token, thinking_mode="chat"
+    )
+    calls = []
+    for call in parsed["tool_calls"]:
+        function = call["function"]
+        namespace = call.get("namespace")
+        name = (
+            function["name"]
+            if namespace is None
+            else f"{namespace}::{function['name']}"
+        )
+        calls.append(ToolCallItem(name=name, arguments=function["arguments"]))
+    return calls or None
 
 
 def _parse_dsml_stream(
