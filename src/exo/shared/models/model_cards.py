@@ -310,6 +310,7 @@ class ConfigData(BaseModel):
             ["Step3p5ForCausalLM"],
             ["NemotronHForCausalLM"],
             ["Gemma4ForConditionalGeneration"],
+            ["MuseGlimmerForConditionalGeneration"],
         ]
 
     @model_validator(mode="before")
