@@ -95,13 +95,18 @@ async def test_add_builtin_deepseek_v41_preserves_exact_official_card(
     monkeypatch.setattr(ModelCard, "fetch_from_hf", fail_fetch)
 
     api, commands = registration_api
+    card = await model_cards.load_builtin_model_card(
+        ModelId("deepseek-ai/DeepSeek-V4.1-Flash")
+    )
+    assert card is not None
+    assert card.n_layers == 40
+    assert card.hidden_size == 5120
+
     result = await api.add_custom_model(
         AddCustomModelParams(model_id=ModelId("deepseek-ai/DeepSeek-V4.1-Flash"))
     )
 
     assert result.base_model == "DeepSeek V4.1 Flash"
-    assert result.n_layers == 40
-    assert result.hidden_size == 5120
     assert result.supports_tensor is True
     assert result.is_custom is False
     assert commands.collect() == []
@@ -120,6 +125,12 @@ async def test_add_builtin_deepseek_v41_engram6_preserves_exact_derivative_card(
     monkeypatch.setattr(ModelCard, "fetch_from_hf", fail_fetch)
 
     api, commands = registration_api
+    card = await model_cards.load_builtin_model_card(
+        ModelId("pipenetwork/DeepSeek-V4.1-Flash-MLX-mixed-4_8bit-engram6")
+    )
+    assert card is not None
+    assert card.storage_size.in_bytes == 476_768_849_256
+
     result = await api.add_custom_model(
         AddCustomModelParams(
             model_id=ModelId(
@@ -131,7 +142,7 @@ async def test_add_builtin_deepseek_v41_engram6_preserves_exact_derivative_card(
     assert result.id == "pipenetwork/DeepSeek-V4.1-Flash-MLX-mixed-4_8bit-engram6"
     assert result.base_model == "DeepSeek V4.1 Flash"
     assert result.quantization == "mixed-4_8bit-engram6"
-    assert result.storage_size.in_bytes == 476_768_849_256
+    assert result.storage_size_megabytes == int(card.storage_size.in_mb)
     assert result.supports_tensor is True
     assert result.is_custom is False
     assert commands.collect() == []
@@ -150,6 +161,12 @@ async def test_add_builtin_deepseek_v41_lower_memory_preserves_exact_derivative_
     monkeypatch.setattr(ModelCard, "fetch_from_hf", fail_fetch)
 
     api, commands = registration_api
+    card = await model_cards.load_builtin_model_card(
+        ModelId("pipenetwork/DeepSeek-V4.1-Flash-MLX-mixed-4_8bit")
+    )
+    assert card is not None
+    assert card.storage_size.in_bytes == 427_615_386_856
+
     result = await api.add_custom_model(
         AddCustomModelParams(
             model_id=ModelId("pipenetwork/DeepSeek-V4.1-Flash-MLX-mixed-4_8bit")
@@ -159,7 +176,7 @@ async def test_add_builtin_deepseek_v41_lower_memory_preserves_exact_derivative_
     assert result.id == "pipenetwork/DeepSeek-V4.1-Flash-MLX-mixed-4_8bit"
     assert result.base_model == "DeepSeek V4.1 Flash"
     assert result.quantization == "mixed-4_8bit"
-    assert result.storage_size.in_bytes == 427_615_386_856
+    assert result.storage_size_megabytes == int(card.storage_size.in_mb)
     assert result.supports_tensor is True
     assert result.is_custom is False
     assert commands.collect() == []
