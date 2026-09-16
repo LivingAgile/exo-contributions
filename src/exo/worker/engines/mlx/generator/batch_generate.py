@@ -43,6 +43,7 @@ from exo.worker.engines.mlx.generator.generate import (
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.patches.opt_batch_gen import (
+    set_sampling_group,
     set_needs_topk,
     take_ready_topk,
 )
@@ -339,6 +340,7 @@ class ExoBatchGenerator:
             gb,
             any(t.task_params.logprobs for t in self._active_tasks.values()),
         )
+        set_sampling_group(gb, self.group)
         _step_tic = time.perf_counter()
         _, responses = self._mlx_gen.next()
         _next_elapsed = time.perf_counter() - _step_tic

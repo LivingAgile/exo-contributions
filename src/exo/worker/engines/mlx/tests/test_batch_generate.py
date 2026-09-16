@@ -12,6 +12,7 @@ Uses random weights — no model download required.
 
 import io
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import mlx.core as mx
@@ -30,6 +31,55 @@ from exo.worker.engines.mlx.generator.generate import prefill
 from exo.worker.engines.mlx.types import Model
 
 NUM_STEPS = 20
+
+
+def test_batch_step_uses_rank_zero_sample_on_every_distributed_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exo.worker.engines.mlx.patches.opt_batch_gen import _patched_step
+
+    class Group:
+        def rank(self) -> int:
+            return 1
+
+        def size(self) -> int:
+            return 2
+
+    class Model:
+        def __call__(self, inputs: mx.array, cache: list[object]) -> mx.array:
+            del inputs, cache
+            return mx.array([[[0.0, 1.0, 2.0, 3.0]]])
+
+    group = Group()
+    gathered_inputs: list[list[int]] = []
+
+    def fake_all_gather(
+        sampled: mx.array, *, group: Group
+    ) -> mx.array:
+        gathered_inputs.append(cast(list[int], sampled.tolist()))
+        return mx.array([7, sampled.item()])
+
+    monkeypatch.setattr(mx.distributed, "all_gather", fake_all_gather)
+    batch = SimpleNamespace(
+        _current_tokens=None,
+        _current_logprobs=[],
+        _next_tokens=mx.array([5]),
+        _next_logprobs=[],
+        _sampling_group=group,
+        model=Model(),
+        prompt_cache=[],
+        logits_processors=None,
+        samplers=None,
+        fallback_sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+        tokens=[[]],
+        uids=[1],
+    )
+
+    emitted, _ = _patched_step(batch)  # type: ignore[arg-type]
+
+    assert emitted == [5]
+    assert gathered_inputs == [[3]]
+    assert batch._next_tokens.tolist() == [7]
 
 
 @pytest.mark.parametrize("needs_topk", [False, True])
