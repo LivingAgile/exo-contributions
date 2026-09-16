@@ -71,6 +71,12 @@ from exo.worker.engines.mlx.types import Model
 from exo.worker.runner.bootstrap import logger
 
 
+DEEPSEEK_V41_ENGRAM6_MODEL_ID = (
+    "pipenetwork/DeepSeek-V4.1-Flash-MLX-mixed-4_8bit-engram6"
+)
+DEEPSEEK_V41_ENGRAM6_REVISION = "a01b0033a2e61ea6920b430b8249ba5b806fbde3"
+
+
 def get_weights_size(model_shard_meta: ShardMetadata) -> Memory:
     return Memory.from_float_kb(
         (model_shard_meta.end_layer - model_shard_meta.start_layer)
@@ -151,17 +157,28 @@ def mlx_distributed_init(
 
 
 def load_model_for_exo(
-    model_path: Path, group: mx.distributed.Group | None = None
+    model_path: Path,
+    group: mx.distributed.Group | None = None,
+    model_id: ModelId | None = None,
 ) -> tuple[nn.Module, dict[str, Any]]:
     config = cast(dict[str, Any], json.loads((model_path / "config.json").read_text()))
     if config.get("model_type") == "deepseek_v41":
         if group is None:
             raise ValueError("deepseek_v41 requires a distributed shard group")
+        model_config = None
+        if model_id == ModelId(DEEPSEEK_V41_ENGRAM6_MODEL_ID):
+            model_config = {
+                "checkpoint_profile": {
+                    "repository": DEEPSEEK_V41_ENGRAM6_MODEL_ID,
+                    "revision": DEEPSEEK_V41_ENGRAM6_REVISION,
+                }
+            }
         return load_model(
             model_path,
             lazy=True,
             strict=True,
             shard_group=group,
+            **({"model_config": model_config} if model_config is not None else {}),
         )
     if config.get("model_type") == "qwen4_exp":
         return load_model(
@@ -208,7 +225,10 @@ def load_mlx_items(
         logger.info(f"Single device used for {bound_instance.instance}")
         model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
         start_time = time.perf_counter()
-        model, _ = load_model_for_exo(model_path)
+        model, _ = load_model_for_exo(
+            model_path,
+            model_id=bound_instance.bound_shard.model_card.model_id,
+        )
         # Eval layers one by one for progress reporting
         try:
             inner = get_inner_model(model)
@@ -277,7 +297,11 @@ def shard_and_load(
 ) -> Generator[ModelLoadingResponse, None, tuple[nn.Module, TokenizerWrapper]]:
     model_path = build_model_path(shard_metadata.model_card.model_id)
 
-    model, _ = load_model_for_exo(model_path, group)
+    model, _ = load_model_for_exo(
+        model_path,
+        group,
+        shard_metadata.model_card.model_id,
+    )
     logger.debug(model)
     if hasattr(model, "model") and isinstance(model.model, DeepseekV3Model):  # type: ignore
         pass

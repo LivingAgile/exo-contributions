@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from exo.shared.types.common import ModelId
 from exo.worker.engines.mlx import utils_mlx
 from exo.worker.engines.mlx.cache import supports_prefix_cache
 from exo.worker.engines.mlx.generator.generate import patch_embed_tokens
@@ -46,6 +47,45 @@ def test_v41_load_is_strict_and_establishes_ownership_before_loading(
     ]
 
 
+def test_v41_engram6_load_injects_exact_checkpoint_profile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v41"})
+    )
+    group = _Group()
+    calls = []
+
+    def fake_load_model(model_path: Path, **kwargs: object):
+        calls.append((model_path, kwargs))
+        return object(), {}
+
+    monkeypatch.setattr(utils_mlx, "load_model", fake_load_model)
+
+    utils_mlx.load_model_for_exo(
+        tmp_path,
+        group,  # type: ignore[arg-type]
+        ModelId(utils_mlx.DEEPSEEK_V41_ENGRAM6_MODEL_ID),
+    )
+
+    assert calls == [
+        (
+            tmp_path,
+            {
+                "lazy": True,
+                "strict": True,
+                "shard_group": group,
+                "model_config": {
+                    "checkpoint_profile": {
+                        "repository": utils_mlx.DEEPSEEK_V41_ENGRAM6_MODEL_ID,
+                        "revision": utils_mlx.DEEPSEEK_V41_ENGRAM6_REVISION,
+                    }
+                },
+            },
+        )
+    ]
+
+
 def test_v41_refuses_single_rank_loading(tmp_path: Path) -> None:
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
     with pytest.raises(ValueError, match="distributed shard group"):
@@ -55,11 +95,15 @@ def test_v41_refuses_single_rank_loading(tmp_path: Path) -> None:
 def test_v4_and_v41_encoding_identities_are_disjoint() -> None:
     v4 = SimpleNamespace(model="mlx-community/DeepSeek-V4-Flash")
     v41 = SimpleNamespace(model="deepseek-ai/DeepSeek-V4.1-Flash")
+    v41_engram6 = SimpleNamespace(model=utils_mlx.DEEPSEEK_V41_ENGRAM6_MODEL_ID)
 
     assert utils_mlx._needs_v4_encoding(v4)  # type: ignore[arg-type]
     assert not utils_mlx._needs_v41_encoding(v4)  # type: ignore[arg-type]
     assert utils_mlx._needs_v41_encoding(v41)  # type: ignore[arg-type]
     assert not utils_mlx._needs_v4_encoding(v41)  # type: ignore[arg-type]
+    assert utils_mlx._needs_v41_encoding(v41_engram6)  # type: ignore[arg-type]
+    assert not utils_mlx._needs_v4_encoding(v41_engram6)  # type: ignore[arg-type]
+    assert v41.model != v41_engram6.model
 
 
 def test_v41_render_uses_the_official_repository_encoder(
