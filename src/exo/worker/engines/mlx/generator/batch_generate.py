@@ -44,7 +44,6 @@ from exo.worker.engines.mlx.generator.generate import (
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.patches.opt_batch_gen import (
     set_needs_topk,
-    set_sampling_group,
     take_ready_topk,
 )
 from exo.worker.engines.mlx.types import KVCacheType, Model
@@ -62,6 +61,23 @@ from exo.worker.runner.bootstrap import logger
 
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
 REMOTE_PREFILL_MIN_TOKENS = 1000
+
+
+def _synchronize_sampler(
+    sampler: Callable[[mx.array], mx.array],
+    group: mx.distributed.Group | None,
+) -> Callable[[mx.array], mx.array]:
+    if group is None or group.size() == 1:
+        return sampler
+
+    def synchronized(logprobs: mx.array) -> mx.array:
+        sampled = sampler(logprobs)
+        sampled_shape = sampled.shape
+        return mx.distributed.all_gather(sampled, group=group).reshape(
+            group.size(), *sampled_shape
+        )[0]
+
+    return synchronized
 
 
 def _stop_sequences(task_params: TextGenerationTaskParams) -> list[str]:
@@ -193,6 +209,7 @@ class ExoBatchGenerator:
             min_p=task_params.min_p if task_params.min_p is not None else 0.05,
             top_k=task_params.top_k if task_params.top_k is not None else 0,
         )
+        sampler = _synchronize_sampler(sampler, self.group)
 
         vision_ctx = (
             patch_embed_tokens(
@@ -340,7 +357,6 @@ class ExoBatchGenerator:
             gb,
             any(t.task_params.logprobs for t in self._active_tasks.values()),
         )
-        set_sampling_group(gb, self.group)
         _step_tic = time.perf_counter()
         _, responses = self._mlx_gen.next()
         _next_elapsed = time.perf_counter() - _step_tic

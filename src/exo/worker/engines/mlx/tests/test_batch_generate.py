@@ -36,6 +36,7 @@ NUM_STEPS = 20
 def test_batch_step_uses_rank_zero_sample_on_every_distributed_rank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from exo.worker.engines.mlx.generator.batch_generate import _synchronize_sampler
     from exo.worker.engines.mlx.patches.opt_batch_gen import _patched_step
 
     class Group:
@@ -60,17 +61,19 @@ def test_batch_step_uses_rank_zero_sample_on_every_distributed_rank(
         return mx.array([7, sampled.item()])
 
     monkeypatch.setattr(mx.distributed, "all_gather", fake_all_gather)
+    sampler = _synchronize_sampler(
+        lambda logprobs: mx.argmax(logprobs, axis=-1), group  # type: ignore[arg-type]
+    )
     batch = SimpleNamespace(
         _current_tokens=None,
         _current_logprobs=[],
         _next_tokens=mx.array([5]),
         _next_logprobs=[],
-        _sampling_group=group,
         model=Model(),
         prompt_cache=[],
         logits_processors=None,
         samplers=None,
-        fallback_sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+        fallback_sampler=sampler,
         tokens=[[]],
         uids=[1],
     )

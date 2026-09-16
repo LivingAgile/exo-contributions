@@ -54,12 +54,6 @@ def set_needs_topk(batch: GenerationBatch, needed: bool) -> None:
     _get_buffer(batch).needs_topk = needed
 
 
-def set_sampling_group(
-    batch: GenerationBatch, group: mx.distributed.Group | None
-) -> None:
-    batch._sampling_group = group  # pyright: ignore[reportAttributeAccessIssue]
-
-
 def take_ready_topk(batch: GenerationBatch) -> BatchTopKLogprobs:
     return _get_buffer(batch).ready
 
@@ -96,13 +90,6 @@ def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
         sampled = mx.concatenate(all_samples, axis=0)
     else:
         sampled = self.fallback_sampler(logprobs)
-
-    group = getattr(self, "_sampling_group", None)
-    if group is not None and group.size() > 1:
-        sampled_shape = sampled.shape
-        sampled = mx.distributed.all_gather(sampled, group=group).reshape(
-            group.size(), *sampled_shape
-        )[0]
 
     self._next_tokens = sampled
     self._next_logprobs = logprobs
