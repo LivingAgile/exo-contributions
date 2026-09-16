@@ -5,10 +5,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 import pytest
 from PIL import Image
 
+from exo.shared.models.model_cards import ModelCard, ModelTask
+from exo.shared.types.backends import Backend
+from exo.shared.types.common import ModelId
+from exo.shared.types.memory import Memory
+from exo.shared.types.worker.shards import TensorShardMetadata
 from exo.worker.engines.mlx import utils_mlx
 from exo.worker.engines.mlx.cache import supports_prefix_cache
 from exo.worker.engines.mlx.generator.generate import patch_embed_tokens
@@ -50,6 +56,61 @@ def test_v41_refuses_single_rank_loading(tmp_path: Path) -> None:
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
     with pytest.raises(ValueError, match="distributed shard group"):
         utils_mlx.load_model_for_exo(tmp_path)
+
+
+def test_shard_and_load_binds_model_specific_tokenizer_before_sharding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    class BindableModel(nn.Module):
+        def bind_tokenizer(self, tokenizer: object) -> None:
+            calls.append(("bind", tokenizer))
+
+    model = BindableModel()
+    tokenizer = object()
+    group = _Group()
+    shard = TensorShardMetadata(
+        model_card=ModelCard(
+            model_id=ModelId("deepseek-ai/DeepSeek-V4.1-Flash"),
+            storage_size=Memory.from_gb(1),
+            n_layers=1,
+            hidden_size=1,
+            supports_tensor=True,
+            tasks=[ModelTask.TextGeneration],
+            backends=[Backend.MlxMetal],
+        ),
+        device_rank=2,
+        world_size=4,
+        start_layer=0,
+        end_layer=1,
+        n_layers=1,
+    )
+
+    def fake_tensor_auto_parallel(loaded_model: nn.Module, loaded_group: _Group):
+        calls.append(("shard", loaded_model, loaded_group))
+        if False:
+            yield
+        return loaded_model
+
+    monkeypatch.setattr(utils_mlx, "build_model_path", lambda _: Path("model"))
+    monkeypatch.setattr(
+        utils_mlx, "load_model_for_exo", lambda *_: (model, {})
+    )
+    monkeypatch.setattr(utils_mlx, "get_tokenizer", lambda *_: tokenizer)
+    monkeypatch.setattr(utils_mlx, "tensor_auto_parallel", fake_tensor_auto_parallel)
+    monkeypatch.setattr(utils_mlx.mx, "eval", lambda *_: None)
+    monkeypatch.setattr(utils_mlx, "mx_barrier", lambda *_: None)
+
+    loader = utils_mlx.shard_and_load(shard, group)  # type: ignore[arg-type]
+    with pytest.raises(StopIteration) as stopped:
+        next(loader)
+
+    assert stopped.value.value == (model, tokenizer)
+    assert calls == [
+        ("bind", tokenizer),
+        ("shard", model, group),
+    ]
 
 
 def test_v4_and_v41_encoding_identities_are_disjoint() -> None:
