@@ -299,6 +299,8 @@ def shard_and_load(
     assert isinstance(model, nn.Module)
 
     tokenizer = get_tokenizer(model_path, shard_metadata)
+    if hasattr(model, "bind_tokenizer"):
+        model.bind_tokenizer(tokenizer)
 
     logger.info(f"Group size: {group.size()}, group rank: {group.rank()}")
 
