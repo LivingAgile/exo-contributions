@@ -75,6 +75,15 @@ DEEPSEEK_V41_ENGRAM6_MODEL_ID = (
     "pipenetwork/DeepSeek-V4.1-Flash-MLX-mixed-4_8bit-engram6"
 )
 DEEPSEEK_V41_ENGRAM6_REVISION = "a01b0033a2e61ea6920b430b8249ba5b806fbde3"
+DEEPSEEK_V41_LOWER_MEMORY_MODEL_ID = (
+    "pipenetwork/DeepSeek-V4.1-Flash-MLX-mixed-4_8bit"
+)
+DEEPSEEK_V41_LOWER_MEMORY_REVISION = "ed2e42e7366f3a993f3499b9f3c4a7043f7828a7"
+
+DEEPSEEK_V41_DERIVATIVE_REVISIONS = {
+    ModelId(DEEPSEEK_V41_ENGRAM6_MODEL_ID): DEEPSEEK_V41_ENGRAM6_REVISION,
+    ModelId(DEEPSEEK_V41_LOWER_MEMORY_MODEL_ID): DEEPSEEK_V41_LOWER_MEMORY_REVISION,
+}
 
 
 def get_weights_size(model_shard_meta: ShardMetadata) -> Memory:
@@ -165,12 +174,12 @@ def load_model_for_exo(
     if config.get("model_type") == "deepseek_v41":
         if group is None:
             raise ValueError("deepseek_v41 requires a distributed shard group")
-        model_config = None
-        if model_id == ModelId(DEEPSEEK_V41_ENGRAM6_MODEL_ID):
+        revision = DEEPSEEK_V41_DERIVATIVE_REVISIONS.get(model_id)
+        if revision is not None:
             model_config = {
                 "checkpoint_profile": {
-                    "repository": DEEPSEEK_V41_ENGRAM6_MODEL_ID,
-                    "revision": DEEPSEEK_V41_ENGRAM6_REVISION,
+                    "repository": str(model_id),
+                    "revision": revision,
                 }
             }
         return load_model(
@@ -178,7 +187,7 @@ def load_model_for_exo(
             lazy=True,
             strict=True,
             shard_group=group,
-            **({"model_config": model_config} if model_config is not None else {}),
+            **({"model_config": model_config} if revision is not None else {}),
         )
     if config.get("model_type") == "qwen4_exp":
         return load_model(

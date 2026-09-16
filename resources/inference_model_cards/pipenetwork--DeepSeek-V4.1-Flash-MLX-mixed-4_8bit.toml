@@ -1,0 +1,20 @@
+model_id = "pipenetwork/DeepSeek-V4.1-Flash-MLX-mixed-4_8bit"
+n_layers = 40
+hidden_size = 5120
+num_key_value_heads = 1
+supports_tensor = true
+tasks = ["TextGeneration"]
+family = "deepseek"
+quantization = "mixed-4_8bit"
+base_model = "DeepSeek V4.1 Flash"
+capabilities = ["text", "thinking", "thinking_toggle", "vision"]
+reasoning_dialect = "tool_conditional"
+context_length = 1048576
+backends = ["MlxMetal"]
+
+[storage_size]
+in_bytes = 427615386856
+
+[sampling_defaults]
+temperature = 1.0
+top_p = 1.0

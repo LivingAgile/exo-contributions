@@ -24,7 +24,7 @@ class _Group:
         return 2
 
 
-def test_v41_load_is_strict_and_establishes_ownership_before_loading(
+def test_official_v41_load_is_strict_without_a_derivative_profile(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
@@ -37,7 +37,11 @@ def test_v41_load_is_strict_and_establishes_ownership_before_loading(
 
     monkeypatch.setattr(utils_mlx, "load_model", fake_load_model)
 
-    utils_mlx.load_model_for_exo(tmp_path, group)  # type: ignore[arg-type]
+    utils_mlx.load_model_for_exo(
+        tmp_path,
+        group,  # type: ignore[arg-type]
+        ModelId("deepseek-ai/DeepSeek-V4.1-Flash"),
+    )
 
     assert calls == [
         (
@@ -47,7 +51,22 @@ def test_v41_load_is_strict_and_establishes_ownership_before_loading(
     ]
 
 
-def test_v41_engram6_load_injects_exact_checkpoint_profile(
+@pytest.mark.parametrize(
+    ("model_id", "revision"),
+    [
+        (
+            utils_mlx.DEEPSEEK_V41_ENGRAM6_MODEL_ID,
+            utils_mlx.DEEPSEEK_V41_ENGRAM6_REVISION,
+        ),
+        (
+            utils_mlx.DEEPSEEK_V41_LOWER_MEMORY_MODEL_ID,
+            utils_mlx.DEEPSEEK_V41_LOWER_MEMORY_REVISION,
+        ),
+    ],
+)
+def test_v41_derivative_load_injects_exact_checkpoint_profile(
+    model_id: str,
+    revision: str,
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     (tmp_path / "config.json").write_text(
@@ -65,7 +84,7 @@ def test_v41_engram6_load_injects_exact_checkpoint_profile(
     utils_mlx.load_model_for_exo(
         tmp_path,
         group,  # type: ignore[arg-type]
-        ModelId(utils_mlx.DEEPSEEK_V41_ENGRAM6_MODEL_ID),
+        ModelId(model_id),
     )
 
     assert calls == [
@@ -77,8 +96,8 @@ def test_v41_engram6_load_injects_exact_checkpoint_profile(
                 "shard_group": group,
                 "model_config": {
                     "checkpoint_profile": {
-                        "repository": utils_mlx.DEEPSEEK_V41_ENGRAM6_MODEL_ID,
-                        "revision": utils_mlx.DEEPSEEK_V41_ENGRAM6_REVISION,
+                        "repository": model_id,
+                        "revision": revision,
                     }
                 },
             },
@@ -96,6 +115,9 @@ def test_v4_and_v41_encoding_identities_are_disjoint() -> None:
     v4 = SimpleNamespace(model="mlx-community/DeepSeek-V4-Flash")
     v41 = SimpleNamespace(model="deepseek-ai/DeepSeek-V4.1-Flash")
     v41_engram6 = SimpleNamespace(model=utils_mlx.DEEPSEEK_V41_ENGRAM6_MODEL_ID)
+    v41_lower_memory = SimpleNamespace(
+        model=utils_mlx.DEEPSEEK_V41_LOWER_MEMORY_MODEL_ID
+    )
 
     assert utils_mlx._needs_v4_encoding(v4)  # type: ignore[arg-type]
     assert not utils_mlx._needs_v41_encoding(v4)  # type: ignore[arg-type]
@@ -103,7 +125,11 @@ def test_v4_and_v41_encoding_identities_are_disjoint() -> None:
     assert not utils_mlx._needs_v4_encoding(v41)  # type: ignore[arg-type]
     assert utils_mlx._needs_v41_encoding(v41_engram6)  # type: ignore[arg-type]
     assert not utils_mlx._needs_v4_encoding(v41_engram6)  # type: ignore[arg-type]
+    assert utils_mlx._needs_v41_encoding(v41_lower_memory)  # type: ignore[arg-type]
+    assert not utils_mlx._needs_v4_encoding(v41_lower_memory)  # type: ignore[arg-type]
     assert v41.model != v41_engram6.model
+    assert v41.model != v41_lower_memory.model
+    assert v41_engram6.model != v41_lower_memory.model
 
 
 def test_v41_render_uses_the_official_repository_encoder(
