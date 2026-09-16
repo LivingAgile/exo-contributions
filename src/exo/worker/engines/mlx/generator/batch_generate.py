@@ -1,4 +1,5 @@
 import contextlib
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -61,6 +62,14 @@ from exo.worker.runner.bootstrap import logger
 
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
 REMOTE_PREFILL_MIN_TOKENS = 1000
+
+
+def _trace_deepseek_v41(model: Model, event: str, **fields: object) -> None:
+    if (
+        model.__class__.__module__ == "mlx_lm.models.deepseek_v41"
+        and os.environ.get("MLX_LM_DEEPSEEK_V41_TRACE") == "1"
+    ):
+        logger.info(f"DEEPSEEK_V41_EXO_TRACE {event} {fields}")
 
 
 def _requires_single_sequence_batches(model: Model) -> bool:
@@ -157,6 +166,13 @@ class ExoBatchGenerator:
         all_prompt_tokens = encode_prompt(self.tokenizer, prompt)
         all_prompt_tokens = fix_unmatched_think_end_tokens(
             all_prompt_tokens, self.tokenizer
+        )
+        _trace_deepseek_v41(
+            self.model,
+            "prompt",
+            token_count=len(all_prompt_tokens),
+            token_tail=cast(list[int], all_prompt_tokens[-24:].tolist()),
+            text_tail=prompt[-240:],
         )
 
         vision: VisionResult | None = None
@@ -312,6 +328,14 @@ class ExoBatchGenerator:
             )
 
         last_tokens = prompt_tokens[-2:]
+        _trace_deepseek_v41(
+            self.model,
+            "post_prefill",
+            cache_offsets=[int(c.offset) for c in cache],
+            prefix_hit_length=prefix_hit_length,
+            remaining_prompt_tokens=len(prompt_tokens),
+            insertion_tokens=cast(list[int], last_tokens.tolist()),
+        )
 
         logits_processors: list[Callable[[mx.array, mx.array], mx.array]] = (
             make_logits_processors(
@@ -383,6 +407,14 @@ class ExoBatchGenerator:
                 continue
 
             state = self._active_tasks[response.uid]
+            _trace_deepseek_v41(
+                self.model,
+                "raw_generation",
+                uid=response.uid,
+                completion_token=state.completion_tokens + 1,
+                token=int(response.token),
+                finish_reason=response.finish_reason,
+            )
             now = time.perf_counter()
             if state.first_gen_token_time is None:
                 state.first_gen_token_time = now
@@ -394,6 +426,15 @@ class ExoBatchGenerator:
             if response.finish_reason is not None:
                 state.detokenizer.finalize()
             text = state.detokenizer.last_segment
+            _trace_deepseek_v41(
+                self.model,
+                "detokenized_generation",
+                uid=response.uid,
+                completion_token=state.completion_tokens + 1,
+                token=int(response.token),
+                text=text,
+                finish_reason=response.finish_reason,
+            )
             state.completion_tokens += 1
             if state.task_params.bench:
                 delta = now - state.first_gen_token_time
