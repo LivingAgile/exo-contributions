@@ -43,8 +43,8 @@ from exo.worker.engines.mlx.generator.generate import (
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.patches.opt_batch_gen import (
-    set_sampling_group,
     set_needs_topk,
+    set_sampling_group,
     take_ready_topk,
 )
 from exo.worker.engines.mlx.types import KVCacheType, Model
