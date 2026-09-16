@@ -33,6 +33,49 @@ from exo.worker.engines.mlx.types import Model
 NUM_STEPS = 20
 
 
+@pytest.mark.parametrize(
+    (
+        "model_module",
+        "expected_completion_batch_size",
+        "expected_prefill_batch_size",
+    ),
+    [
+        ("mlx_lm.models.deepseek_v41", 1, 1),
+        ("mlx_lm.models.llama", 32, 8),
+    ],
+)
+def test_deepseek_v41_requests_are_serialized_before_cache_extension(
+    model_module: str,
+    expected_completion_batch_size: int,
+    expected_prefill_batch_size: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import exo.worker.engines.mlx.generator.batch_generate as batch_generate
+
+    captured: dict[str, object] = {}
+
+    class BatchGenerator:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    model_type = type("TestModel", (), {"__module__": model_module})
+    monkeypatch.setattr(batch_generate, "MlxBatchGenerator", BatchGenerator)
+    monkeypatch.setattr(batch_generate, "eos_ids_from_tokenizer", lambda _: [])
+
+    batch_generate.ExoBatchGenerator(
+        model=cast(Model, model_type()),
+        tokenizer=cast(TokenizerWrapper, object()),
+        group=None,
+        kv_prefix_cache=None,
+    )
+
+    assert (
+        captured.get("completion_batch_size", 32)
+        == expected_completion_batch_size
+    )
+    assert captured.get("prefill_batch_size", 8) == expected_prefill_batch_size
+
+
 def test_batch_step_uses_rank_zero_sample_on_every_distributed_rank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

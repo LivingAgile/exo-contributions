@@ -63,6 +63,10 @@ _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
 REMOTE_PREFILL_MIN_TOKENS = 1000
 
 
+def _requires_single_sequence_batches(model: Model) -> bool:
+    return model.__class__.__module__ == "mlx_lm.models.deepseek_v41"
+
+
 def _synchronize_sampler(
     sampler: Callable[[mx.array], mx.array],
     group: mx.distributed.Group | None,
@@ -120,10 +124,16 @@ class ExoBatchGenerator:
     _active_tasks: dict[int, _EngineTask] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
+        batch_sizes = (
+            {"completion_batch_size": 1, "prefill_batch_size": 1}
+            if _requires_single_sequence_batches(self.model)
+            else {}
+        )
         self._mlx_gen = MlxBatchGenerator(
             model=self.model,
             stop_tokens=[[t] for t in eos_ids_from_tokenizer(self.tokenizer)],
             prefill_step_size=4096,
+            **batch_sizes,
         )
         self._step_count = 0
 
