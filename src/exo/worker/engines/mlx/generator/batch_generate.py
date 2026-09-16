@@ -255,40 +255,42 @@ class ExoBatchGenerator:
             and uncached_count > REMOTE_PREFILL_MIN_TOKENS
             and task_params.prefill_endpoint is not None
         )
+        use_native_batch_prefill = _requires_single_sequence_batches(self.model)
 
         _prefill_tps: float = 0.0
         _prefill_tokens: int = 0
         cache_snapshots: list[CacheSnapshot] = []
         remote_prefilled = False
-        with vision_ctx as prefill_model:
-            if use_remote and task_params.prefill_endpoint is not None:
-                try:
-                    _prefill_tps, _prefill_tokens, cache_snapshots = remote_prefill(
+        if not use_native_batch_prefill:
+            with vision_ctx as prefill_model:
+                if use_remote and task_params.prefill_endpoint is not None:
+                    try:
+                        _prefill_tps, _prefill_tokens, cache_snapshots = remote_prefill(
+                            prompt_tokens[:-1],
+                            cache,
+                            on_prefill_progress,
+                            endpoint=task_params.prefill_endpoint,
+                            request_id=str(uuid.uuid4()),
+                            model_id=str(task_params.model),
+                            start_pos=prefix_hit_length,
+                        )
+                        remote_prefilled = True
+                    except Exception:
+                        logger.opt(exception=True).warning(
+                            "Remote prefill failed, falling back to local prefill"
+                        )
+
+                if not remote_prefilled:
+                    _prefill_tps, _prefill_tokens, cache_snapshots = prefill(
+                        prefill_model,
+                        self.tokenizer,
+                        sampler,
                         prompt_tokens[:-1],
                         cache,
+                        self.group,
                         on_prefill_progress,
-                        endpoint=task_params.prefill_endpoint,
-                        request_id=str(uuid.uuid4()),
-                        model_id=str(task_params.model),
-                        start_pos=prefix_hit_length,
+                        distributed_prompt_progress_callback,
                     )
-                    remote_prefilled = True
-                except Exception:
-                    logger.opt(exception=True).warning(
-                        "Remote prefill failed, falling back to local prefill"
-                    )
-
-            if not remote_prefilled:
-                _prefill_tps, _prefill_tokens, cache_snapshots = prefill(
-                    prefill_model,
-                    self.tokenizer,
-                    sampler,
-                    prompt_tokens[:-1],
-                    cache,
-                    self.group,
-                    on_prefill_progress,
-                    distributed_prompt_progress_callback,
-                )
 
         prefix_cache_hit: Literal["none", "partial", "exact"] = "none"
         if matched_index is not None and prefix_hit_length > 0:
@@ -327,14 +329,16 @@ class ExoBatchGenerator:
                 prefill_tps=_prefill_tps,
             )
 
-        last_tokens = prompt_tokens[-2:]
+        insertion_tokens = (
+            prompt_tokens if use_native_batch_prefill else prompt_tokens[-2:]
+        )
         _trace_deepseek_v41(
             self.model,
             "post_prefill",
             cache_offsets=[int(c.offset) for c in cache],
             prefix_hit_length=prefix_hit_length,
             remaining_prompt_tokens=len(prompt_tokens),
-            insertion_tokens=cast(list[int], last_tokens.tolist()),
+            insertion_tokens=cast(list[int], insertion_tokens.tolist()),
         )
 
         logits_processors: list[Callable[[mx.array, mx.array], mx.array]] = (
@@ -355,7 +359,7 @@ class ExoBatchGenerator:
         max_tokens = task_params.max_output_tokens or MAX_TOKENS
 
         uids = self._mlx_gen.insert(
-            prompts=[cast(list[int], last_tokens.tolist())],
+            prompts=[cast(list[int], insertion_tokens.tolist())],
             max_tokens=[max_tokens],
             caches=[list(cache)],
             samplers=[sampler],
