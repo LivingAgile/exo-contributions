@@ -1,4 +1,5 @@
 import contextlib
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -31,6 +32,7 @@ from exo.worker.engines.mlx.cache import (
     KVPrefixCache,
     encode_prompt,
     make_kv_cache,
+    supports_prefix_cache,
 )
 from exo.worker.engines.mlx.constants import DEFAULT_TOP_LOGPROBS, MAX_TOKENS
 from exo.worker.engines.mlx.generator.generate import (
@@ -52,7 +54,7 @@ from exo.worker.engines.mlx.utils_mlx import (
 )
 from exo.worker.engines.mlx.vision import (
     MediaRegion,
-    VisionProcessor,
+    VisionProcessorType,
     VisionResult,
     prepare_vision,
 )
@@ -60,6 +62,35 @@ from exo.worker.runner.bootstrap import logger
 
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
 REMOTE_PREFILL_MIN_TOKENS = 1000
+
+
+def _trace_deepseek_v41(model: Model, event: str, **fields: object) -> None:
+    if (
+        model.__class__.__module__ == "mlx_lm.models.deepseek_v41"
+        and os.environ.get("MLX_LM_DEEPSEEK_V41_TRACE") == "1"
+    ):
+        logger.info(f"DEEPSEEK_V41_EXO_TRACE {event} {fields}")
+
+
+def _requires_single_sequence_batches(model: Model) -> bool:
+    return model.__class__.__module__ == "mlx_lm.models.deepseek_v41"
+
+
+def _synchronize_sampler(
+    sampler: Callable[[mx.array], mx.array],
+    group: mx.distributed.Group | None,
+) -> Callable[[mx.array], mx.array]:
+    if group is None or group.size() == 1:
+        return sampler
+
+    def synchronized(logprobs: mx.array) -> mx.array:
+        sampled = sampler(logprobs)
+        sampled_shape = sampled.shape
+        return mx.distributed.all_gather(sampled, group=group).reshape(
+            group.size(), *sampled_shape
+        )[0]
+
+    return synchronized
 
 
 def _stop_sequences(task_params: TextGenerationTaskParams) -> list[str]:
@@ -96,16 +127,22 @@ class ExoBatchGenerator:
     tokenizer: TokenizerWrapper
     group: mx.distributed.Group | None
     kv_prefix_cache: KVPrefixCache | None
-    vision_processor: VisionProcessor | None = None
+    vision_processor: VisionProcessorType | None = None
 
     _mlx_gen: MlxBatchGenerator = field(init=False)
     _active_tasks: dict[int, _EngineTask] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
+        batch_sizes = (
+            {"completion_batch_size": 1, "prefill_batch_size": 1}
+            if _requires_single_sequence_batches(self.model)
+            else {}
+        )
         self._mlx_gen = MlxBatchGenerator(
             model=self.model,
             stop_tokens=[[t] for t in eos_ids_from_tokenizer(self.tokenizer)],
             prefill_step_size=4096,
+            **batch_sizes,
         )
         self._step_count = 0
 
@@ -129,6 +166,13 @@ class ExoBatchGenerator:
         all_prompt_tokens = encode_prompt(self.tokenizer, prompt)
         all_prompt_tokens = fix_unmatched_think_end_tokens(
             all_prompt_tokens, self.tokenizer
+        )
+        _trace_deepseek_v41(
+            self.model,
+            "prompt",
+            token_count=len(all_prompt_tokens),
+            token_tail=cast(list[int], all_prompt_tokens[-24:].tolist()),
+            text_tail=prompt[-240:],
         )
 
         vision: VisionResult | None = None
@@ -161,9 +205,10 @@ class ExoBatchGenerator:
         is_exact_hit = False
         prompt_tokens = all_prompt_tokens
 
-        if self.kv_prefix_cache is not None and (
+        use_prefix_cache = supports_prefix_cache(self.model) and (
             not is_bench or task_params.use_prefix_cache
-        ):
+        )
+        if self.kv_prefix_cache is not None and use_prefix_cache:
             cache, remaining_tokens, matched_index, is_exact_hit = (
                 self.kv_prefix_cache.get_kv_cache(
                     self.model, all_prompt_tokens, media_regions=media_regions
@@ -190,6 +235,7 @@ class ExoBatchGenerator:
             min_p=task_params.min_p if task_params.min_p is not None else 0.05,
             top_k=task_params.top_k if task_params.top_k is not None else 0,
         )
+        sampler = _synchronize_sampler(sampler, self.group)
 
         vision_ctx = (
             patch_embed_tokens(
@@ -198,49 +244,53 @@ class ExoBatchGenerator:
                 prefix_hit_length,
                 len(prompt_tokens) - 1,
                 image_token_id=vision.image_token_id,
+                token_types=vision.token_types,
             )
             if vision is not None
-            else contextlib.nullcontext()
+            else contextlib.nullcontext(self.model)
         )
         uncached_count = len(prompt_tokens)
         use_remote = (
-            uncached_count > REMOTE_PREFILL_MIN_TOKENS
+            vision is None
+            and uncached_count > REMOTE_PREFILL_MIN_TOKENS
             and task_params.prefill_endpoint is not None
         )
+        use_native_batch_prefill = _requires_single_sequence_batches(self.model)
 
         _prefill_tps: float = 0.0
         _prefill_tokens: int = 0
         cache_snapshots: list[CacheSnapshot] = []
         remote_prefilled = False
-        with vision_ctx:
-            if use_remote and task_params.prefill_endpoint is not None:
-                try:
-                    _prefill_tps, _prefill_tokens, cache_snapshots = remote_prefill(
+        if not use_native_batch_prefill:
+            with vision_ctx as prefill_model:
+                if use_remote and task_params.prefill_endpoint is not None:
+                    try:
+                        _prefill_tps, _prefill_tokens, cache_snapshots = remote_prefill(
+                            prompt_tokens[:-1],
+                            cache,
+                            on_prefill_progress,
+                            endpoint=task_params.prefill_endpoint,
+                            request_id=str(uuid.uuid4()),
+                            model_id=str(task_params.model),
+                            start_pos=prefix_hit_length,
+                        )
+                        remote_prefilled = True
+                    except Exception:
+                        logger.opt(exception=True).warning(
+                            "Remote prefill failed, falling back to local prefill"
+                        )
+
+                if not remote_prefilled:
+                    _prefill_tps, _prefill_tokens, cache_snapshots = prefill(
+                        prefill_model,
+                        self.tokenizer,
+                        sampler,
                         prompt_tokens[:-1],
                         cache,
+                        self.group,
                         on_prefill_progress,
-                        endpoint=task_params.prefill_endpoint,
-                        request_id=str(uuid.uuid4()),
-                        model_id=str(task_params.model),
-                        start_pos=prefix_hit_length,
+                        distributed_prompt_progress_callback,
                     )
-                    remote_prefilled = True
-                except Exception:
-                    logger.opt(exception=True).warning(
-                        "Remote prefill failed, falling back to local prefill"
-                    )
-
-            if not remote_prefilled:
-                _prefill_tps, _prefill_tokens, cache_snapshots = prefill(
-                    self.model,
-                    self.tokenizer,
-                    sampler,
-                    prompt_tokens[:-1],
-                    cache,
-                    self.group,
-                    on_prefill_progress,
-                    distributed_prompt_progress_callback,
-                )
 
         prefix_cache_hit: Literal["none", "partial", "exact"] = "none"
         if matched_index is not None and prefix_hit_length > 0:
@@ -264,7 +314,7 @@ class ExoBatchGenerator:
                 c.values = c._trim(trim_size, c.values)
                 c._idx = c.max_size
 
-        if not is_bench or task_params.use_prefix_cache:
+        if use_prefix_cache:
             min_prefix_hit_length = max(
                 1000, system_prompt_token_count(task_params, self.tokenizer)
             )
@@ -279,7 +329,21 @@ class ExoBatchGenerator:
                 prefill_tps=_prefill_tps,
             )
 
-        last_tokens = prompt_tokens[-2:]
+        insertion_tokens = (
+            prompt_tokens if use_native_batch_prefill else prompt_tokens[-2:]
+        )
+        if (
+            _requires_single_sequence_batches(self.model)
+            and os.environ.get("MLX_LM_DEEPSEEK_V41_TRACE") == "1"
+        ):
+            _trace_deepseek_v41(
+                self.model,
+                "post_prefill",
+                cache_offsets=[int(c.offset) for c in cache],
+                prefix_hit_length=prefix_hit_length,
+                remaining_prompt_tokens=len(prompt_tokens),
+                insertion_tokens=cast(list[int], insertion_tokens.tolist()),
+            )
 
         logits_processors: list[Callable[[mx.array, mx.array], mx.array]] = (
             make_logits_processors(
@@ -299,7 +363,7 @@ class ExoBatchGenerator:
         max_tokens = task_params.max_output_tokens or MAX_TOKENS
 
         uids = self._mlx_gen.insert(
-            prompts=[cast(list[int], last_tokens.tolist())],
+            prompts=[cast(list[int], insertion_tokens.tolist())],
             max_tokens=[max_tokens],
             caches=[list(cache)],
             samplers=[sampler],
@@ -351,6 +415,14 @@ class ExoBatchGenerator:
                 continue
 
             state = self._active_tasks[response.uid]
+            _trace_deepseek_v41(
+                self.model,
+                "raw_generation",
+                uid=response.uid,
+                completion_token=state.completion_tokens + 1,
+                token=int(response.token),
+                finish_reason=response.finish_reason,
+            )
             now = time.perf_counter()
             if state.first_gen_token_time is None:
                 state.first_gen_token_time = now
@@ -362,6 +434,15 @@ class ExoBatchGenerator:
             if response.finish_reason is not None:
                 state.detokenizer.finalize()
             text = state.detokenizer.last_segment
+            _trace_deepseek_v41(
+                self.model,
+                "detokenized_generation",
+                uid=response.uid,
+                completion_token=state.completion_tokens + 1,
+                token=int(response.token),
+                text=text,
+                finish_reason=response.finish_reason,
+            )
             state.completion_tokens += 1
             if state.task_params.bench:
                 delta = now - state.first_gen_token_time

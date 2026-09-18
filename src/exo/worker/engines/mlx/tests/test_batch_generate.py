@@ -12,6 +12,7 @@ Uses random weights — no model download required.
 
 import io
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import mlx.core as mx
@@ -30,6 +31,168 @@ from exo.worker.engines.mlx.generator.generate import prefill
 from exo.worker.engines.mlx.types import Model
 
 NUM_STEPS = 20
+
+
+@pytest.mark.parametrize("trace_enabled", ["0", "1"])
+def test_submission_accepts_nested_cache_with_deepseek_tracing(
+    trace_enabled: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
+    from mlx_lm.models.deepseek_v32 import ModelArgs as DeepseekV32ModelArgs
+    from mlx_lm.models.cache import CacheList
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    from exo.shared.types.text_generation import TextGenerationTaskParams
+    from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
+
+    monkeypatch.setenv("MLX_LM_DEEPSEEK_V41_TRACE", trace_enabled)
+    tokenizer_backend = Tokenizer(
+        WordLevel({"[UNK]": 0, "hello": 1, "world": 2, "[EOS]": 3}, unk_token="[UNK]")
+    )
+    tokenizer_backend.pre_tokenizer = Whitespace()
+    tokenizer = TokenizerWrapper(
+        PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer_backend, unk_token="[UNK]", eos_token="[EOS]"
+        )
+    )
+    model = DeepseekV32Model(
+        DeepseekV32ModelArgs.from_dict(
+            {
+                "model_type": "deepseek_v32",
+                "vocab_size": 16,
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "moe_intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "n_routed_experts": 4,
+                "n_group": 2,
+                "topk_group": 1,
+                "num_experts_per_tok": 2,
+                "n_shared_experts": 1,
+                "kv_lora_rank": 4,
+                "q_lora_rank": 4,
+                "qk_rope_head_dim": 32,
+                "v_head_dim": 16,
+                "qk_nope_head_dim": 32,
+                "index_head_dim": 32,
+                "index_n_heads": 2,
+                "index_topk": 8,
+            }
+        )
+    )
+    assert isinstance(model.make_cache()[0], CacheList)
+    generator = ExoBatchGenerator(
+        model=cast(Model, model), tokenizer=tokenizer, group=None, kv_prefix_cache=None
+    )
+    task = TextGenerationTaskParams.model_validate(
+        {
+            "model": "diagnostic/deepseek-v32",
+            "input": [],
+            "max_output_tokens": 2,
+            "temperature": 0,
+        }
+    )
+
+    identifier = generator.submit(task, "hello world hello world")
+
+    assert identifier in generator._active_tasks
+    assert generator.has_work
+
+
+@pytest.mark.parametrize(
+    (
+        "model_module",
+        "expected_completion_batch_size",
+        "expected_prefill_batch_size",
+    ),
+    [
+        ("mlx_lm.models.deepseek_v41", 1, 1),
+        ("mlx_lm.models.llama", 32, 8),
+    ],
+)
+def test_deepseek_v41_requests_are_serialized_before_cache_extension(
+    model_module: str,
+    expected_completion_batch_size: int,
+    expected_prefill_batch_size: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import exo.worker.engines.mlx.generator.batch_generate as batch_generate
+
+    captured: dict[str, object] = {}
+
+    class BatchGenerator:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    model_type = type("TestModel", (), {"__module__": model_module})
+    monkeypatch.setattr(batch_generate, "MlxBatchGenerator", BatchGenerator)
+    monkeypatch.setattr(batch_generate, "eos_ids_from_tokenizer", lambda _: [])
+
+    batch_generate.ExoBatchGenerator(
+        model=cast(Model, model_type()),
+        tokenizer=cast(TokenizerWrapper, object()),
+        group=None,
+        kv_prefix_cache=None,
+    )
+
+    assert captured.get("completion_batch_size", 32) == expected_completion_batch_size
+    assert captured.get("prefill_batch_size", 8) == expected_prefill_batch_size
+
+
+def test_batch_step_uses_rank_zero_sample_on_every_distributed_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from exo.worker.engines.mlx.generator.batch_generate import _synchronize_sampler
+    from exo.worker.engines.mlx.patches.opt_batch_gen import _patched_step
+
+    class Group:
+        def rank(self) -> int:
+            return 1
+
+        def size(self) -> int:
+            return 2
+
+    class Model:
+        def __call__(self, inputs: mx.array, cache: list[object]) -> mx.array:
+            del inputs, cache
+            return mx.array([[[0.0, 1.0, 2.0, 3.0]]])
+
+    group = Group()
+    gathered_inputs: list[list[int]] = []
+
+    def fake_all_gather(sampled: mx.array, *, group: Group) -> mx.array:
+        gathered_inputs.append(cast(list[int], sampled.tolist()))
+        return mx.array([7, sampled.item()])
+
+    monkeypatch.setattr(mx.distributed, "all_gather", fake_all_gather)
+    sampler = _synchronize_sampler(
+        lambda logprobs: mx.argmax(logprobs, axis=-1),
+        group,  # type: ignore[arg-type]
+    )
+    batch = SimpleNamespace(
+        _current_tokens=None,
+        _current_logprobs=[],
+        _next_tokens=mx.array([5]),
+        _next_logprobs=[],
+        model=Model(),
+        prompt_cache=[],
+        logits_processors=None,
+        samplers=None,
+        fallback_sampler=sampler,
+        tokens=[[]],
+        uids=[1],
+    )
+
+    emitted, _ = _patched_step(batch)  # type: ignore[arg-type]
+
+    assert emitted == [5]
+    assert gathered_inputs == [[3]]
+    assert batch._next_tokens.tolist() == [7]
 
 
 @pytest.mark.parametrize("needs_topk", [False, True])
@@ -131,9 +294,11 @@ def _init_random(model: nn.Module) -> None:
     """Initialize all model parameters with random values."""
     params = model.parameters()
     new_params = mlx.utils.tree_map(
-        lambda p: mx.random.normal(shape=p.shape, dtype=p.dtype)
-        if isinstance(p, mx.array)
-        else p,
+        lambda p: (
+            mx.random.normal(shape=p.shape, dtype=p.dtype)
+            if isinstance(p, mx.array)
+            else p
+        ),
         params,
     )
     model.update(new_params)

@@ -26,7 +26,7 @@ from .utils_mlx import (
     initialize_mlx,
     load_mlx_items,
 )
-from .vision import VisionProcessor
+from .vision import VisionProcessorType
 
 
 @dataclass
@@ -37,7 +37,7 @@ class MlxBuilder(Builder):
     inference_model: Model | None = None
     tokenizer: TokenizerWrapper | None = None
     group: mx.distributed.Group | None = None
-    vision_processor: VisionProcessor | None = None
+    vision_processor: VisionProcessorType | None = None
 
     def connect(self, bound_instance: BoundInstance) -> None:
         self.group = initialize_mlx(bound_instance)

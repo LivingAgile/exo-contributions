@@ -48,6 +48,7 @@ from exo.worker.engines.mlx.cache import (
     is_non_trimmable_cache_entry,
     make_kv_cache,
     snapshot_ssm_states,
+    supports_prefix_cache,
 )
 from exo.worker.engines.mlx.constants import (
     DEFAULT_TOP_LOGPROBS,
@@ -65,7 +66,7 @@ from exo.worker.engines.mlx.utils_mlx import (
 )
 from exo.worker.engines.mlx.vision import (
     MediaRegion,
-    VisionProcessor,
+    VisionProcessorType,
     VisionResult,
     get_inner_model,
     prepare_vision,
@@ -79,6 +80,44 @@ generation_stream = mx.new_stream(mx.default_device())
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
 
 
+class _VisionTokenTypeModel:
+    def __init__(
+        self,
+        model: Model,
+        token_types: mx.array,
+        start_offset: int,
+    ):
+        self._model = model
+        self._token_types = token_types
+        self._offset = start_offset
+
+    def __getattr__(self, name: str):
+        return getattr(self._model, name)
+
+    def __call__(self, inputs: mx.array, cache=None, **kwargs):
+        chunk_start = self._offset
+        if cache and hasattr(cache[0], "offset"):
+            chunk_start = int(cache[0].offset)
+        chunk_length = int(inputs.shape[-1])
+        chunk_end = chunk_start + chunk_length
+        self._offset = chunk_end
+
+        available_end = min(chunk_end, int(self._token_types.shape[0]))
+        if chunk_start < available_end:
+            present = self._token_types[chunk_start:available_end]
+            if available_end < chunk_end:
+                present = mx.concatenate(
+                    [
+                        present,
+                        mx.full((chunk_end - available_end,), -1, dtype=mx.int32),
+                    ]
+                )
+            token_types = mx.broadcast_to(present[None], inputs.shape)
+        else:
+            token_types = mx.full(inputs.shape, -1, dtype=mx.int32)
+        return self._model(inputs, cache=cache, token_types=token_types, **kwargs)
+
+
 @contextlib.contextmanager
 def patch_embed_tokens(
     model: Model,
@@ -86,9 +125,12 @@ def patch_embed_tokens(
     start_offset: int = 0,
     token_count: int = 0,
     image_token_id: int | None = None,
-) -> Generator[None]:
-    inner = get_inner_model(model)  # type: ignore
-    original_embed = inner.embed_tokens  # type: ignore
+    token_types: mx.array | None = None,
+) -> Generator[Model]:
+    is_deepseek_v41 = model.__class__.__module__ == "mlx_lm.models.deepseek_v41"
+    inner = model if is_deepseek_v41 else get_inner_model(model)  # type: ignore
+    embed_name = "embed" if is_deepseek_v41 else "embed_tokens"
+    original_embed = getattr(inner, embed_name)  # type: ignore
     end_offset = start_offset + token_count
     offset = [start_offset]
 
@@ -123,7 +165,7 @@ def patch_embed_tokens(
             with contextlib.suppress(AttributeError, TypeError):
                 setattr(_inject, attr, getattr(original_embed, attr))  # type: ignore
 
-    inner.embed_tokens = _inject
+    setattr(inner, embed_name, _inject)
 
     # Gemma 4 (e2b/e4b) has a second, independent embedding table that produces
     # per-layer conditioning signals via self.embed_tokens_per_layer(input_ids).
@@ -143,9 +185,17 @@ def patch_embed_tokens(
         inner.embed_tokens_per_layer = _clean_per_layer
 
     try:
-        yield
+        if is_deepseek_v41:
+            if token_types is None:
+                raise ValueError("deepseek_v41 vision requires image token types")
+            yield cast(
+                Model,
+                _VisionTokenTypeModel(model, token_types, start_offset),
+            )
+        else:
+            yield model
     finally:
-        inner.embed_tokens = original_embed
+        setattr(inner, embed_name, original_embed)
         if original_per_layer is not None and image_token_id is not None:
             inner.embed_tokens_per_layer = original_per_layer
 
@@ -539,7 +589,7 @@ def mlx_generate(
     on_prefill_progress: Callable[[int, int], None] | None = None,
     distributed_prompt_progress_callback: Callable[[], None] | None = None,
     on_generation_token: Callable[[], None] | None = None,
-    vision_processor: VisionProcessor | None = None,
+    vision_processor: VisionProcessorType | None = None,
 ) -> Generator[GenerationResponse]:
     # Ensure that generation stats only contains peak memory for this generation
     mx.reset_peak_memory()
@@ -575,6 +625,9 @@ def mlx_generate(
     # Do not use the prefix cache if we are trying to do benchmarks.
     is_bench = task.bench
     if is_bench and not task.use_prefix_cache:
+        kv_prefix_cache = None
+    if kv_prefix_cache is not None and not supports_prefix_cache(model):
+        logger.info("Prefix cache disabled for deepseek_v41 shared attention state")
         kv_prefix_cache = None
 
     # Use prefix cache if available, otherwise create fresh cache
@@ -633,19 +686,21 @@ def mlx_generate(
             prefix_hit_length,
             len(prompt_tokens) - 1,
             image_token_id=vision.image_token_id,
+            token_types=vision.token_types,
         )
         if vision is not None
-        else contextlib.nullcontext()
+        else contextlib.nullcontext(model)
     )
     use_remote = (
-        len(prompt_tokens) > REMOTE_PREFILL_MIN_TOKENS
+        vision is None
+        and len(prompt_tokens) > REMOTE_PREFILL_MIN_TOKENS
         and task.prefill_endpoint is not None
     )
     remote_prefilled = False
     prefill_tps = 0.0
     prefill_tokens = 0
     ssm_snapshots_list: list[CacheSnapshot] = []
-    with maybe_vision_ctx:
+    with maybe_vision_ctx as prefill_model:
         if use_remote and task.prefill_endpoint is not None:
             try:
                 prefill_tps, prefill_tokens, ssm_snapshots_list = remote_prefill(
@@ -664,7 +719,7 @@ def mlx_generate(
                 )
         if not remote_prefilled:
             prefill_tps, prefill_tokens, ssm_snapshots_list = prefill(
-                model,
+                prefill_model,
                 tokenizer,
                 sampler,
                 prompt_tokens[:-1],

@@ -23,6 +23,7 @@ from mlx_lm.models.deepseek_v4 import DeepseekV4MoE, V4Attention
 from mlx_lm.models.deepseek_v4 import Model as DeepseekV4Model
 from mlx_lm.models.deepseek_v32 import DeepseekV32MLP
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
+from mlx_lm.models.deepseek_v41 import Model as DeepseekV41Model
 from mlx_lm.models.gemma4 import Model as Gemma4Model
 from mlx_lm.models.glm4_moe import Model as Glm4MoeModel
 from mlx_lm.models.glm4_moe import MoE
@@ -630,6 +631,8 @@ def tensor_auto_parallel(
             all_to_sharded_linear_in_place,
             sharded_to_all_linear_in_place,
         )
+    elif isinstance(model, DeepseekV41Model):
+        tensor_parallel_sharding_strategy = DeepseekV41ShardingStrategy(group)
     elif isinstance(model, MiniMaxModel):
         tensor_parallel_sharding_strategy = MiniMaxShardingStrategy(
             group,
@@ -1338,6 +1341,25 @@ class DeepseekV4ShardingStrategy(TensorParallelShardingStrategy):
             mx.clear_cache()
             yield ModelLoadingResponse(layers_loaded=i, total=total)
 
+        return model
+
+
+class DeepseekV41ShardingStrategy(TensorParallelShardingStrategy):
+    """Report progress for a model already sharded before weight loading."""
+
+    def __init__(self, group: mx.distributed.Group):
+        self.group = group
+
+    def shard_model(
+        self,
+        model: nn.Module,
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
+        model = cast(DeepseekV41Model, model)
+        total = len(model.layers)
+        for index, layer in enumerate(model.layers):
+            mx.eval(layer.parameters())
+            mx.clear_cache()
+            yield ModelLoadingResponse(layers_loaded=index, total=total)
         return model
 
 

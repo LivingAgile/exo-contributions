@@ -557,6 +557,10 @@ def get_memory_used_percentage() -> float:
     return float(mem.percent / 100)
 
 
+def supports_prefix_cache(model: Model) -> bool:
+    return model.__class__.__module__ != "mlx_lm.models.deepseek_v41"
+
+
 def make_kv_cache(
     model: Model, max_kv_size: int | None = None, keep: int = 0
 ) -> KVCacheType:

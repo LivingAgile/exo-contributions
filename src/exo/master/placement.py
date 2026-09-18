@@ -138,7 +138,11 @@ def place_instance(
         # TODO: the condition here for tensor parallel is not correct, but it works good enough for now.
         # DeepSeek V4 head-parallelises wq_b/wo_a, while Qwen4Exp replicates
         # attention and shards only MoE projections. Neither splits KV heads.
-        is_deepseek_v4 = command.model_card.base_model.startswith("DeepSeek V4")
+        is_deepseek_v4 = command.model_card.base_model in (
+            "DeepSeek V4 Flash",
+            "DeepSeek V4 Pro",
+        )
+        is_deepseek_v41 = command.model_card.base_model == "DeepSeek V4.1 Flash"
         is_qwen4_exp = (
             command.model_card.vision is not None
             and command.model_card.vision.model_type == "qwen4_exp"
@@ -148,7 +152,7 @@ def place_instance(
             and command.model_card.vision.model_type == "muse_glimmer"
         )
         uses_replicated_kv_heads = (
-            is_deepseek_v4 or is_qwen4_exp or is_muse_glimmer
+            is_deepseek_v4 or is_deepseek_v41 or is_qwen4_exp or is_muse_glimmer
         )
         kv_heads = command.model_card.num_key_value_heads
         cycles_with_sufficient_memory = [
