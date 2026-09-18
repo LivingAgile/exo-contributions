@@ -33,6 +33,87 @@ from exo.worker.engines.mlx.types import Model
 NUM_STEPS = 20
 
 
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "deepseek-ai/DeepSeek-V4.1-Flash",
+        "pipenetwork/DeepSeek-V4.1-Flash-MLX-mixed-4_8bit-engram6",
+    ],
+)
+@pytest.mark.parametrize("enable_thinking", [False, True])
+@pytest.mark.parametrize("engine", ["batch", "sequential"])
+def test_v41_submission_preserves_canonical_prompt_tokens(
+    model_id: str, enable_thinking: bool, engine: str
+) -> None:
+    from mlx_lm.models.llama import Model as LlamaModel
+    from mlx_lm.models.llama import ModelArgs
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    from exo.shared.types.text_generation import TextGenerationTaskParams
+    from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
+    from exo.worker.engines.mlx.generator.generate import mlx_generate
+    from exo.worker.engines.mlx.utils_mlx import render_chat_template
+
+    model = LlamaModel(
+        ModelArgs(
+            model_type="llama",
+            hidden_size=16,
+            num_hidden_layers=1,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            vocab_size=16,
+            rms_norm_eps=1e-5,
+        )
+    )
+    tokenizer = TokenizerWrapper(
+        PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(
+                WordLevel(
+                    {"[UNK]": 0, "<think>": 1, "</think>": 2, "[EOS]": 3},
+                    unk_token="[UNK]",
+                )
+            ),
+            unk_token="[UNK]",
+            eos_token="[EOS]",
+            additional_special_tokens=["<think>", "</think>"],
+        )
+    )
+    task = TextGenerationTaskParams.model_validate(
+        {
+            "model": model_id,
+            "input": [],
+            "enable_thinking": enable_thinking,
+            "reasoning_effort": "low" if enable_thinking else "none",
+            "max_output_tokens": 2,
+            "temperature": 0,
+        }
+    )
+    prompt = render_chat_template(
+        tokenizer, [{"role": "user", "content": "hello"}], task
+    )
+    expected = encode_prompt(tokenizer, prompt).tolist()
+    if engine == "sequential":
+        responses = list(
+            mlx_generate(cast(Model, model), tokenizer, task, prompt, None, None)
+        )
+        assert responses[-1].usage is not None
+        assert responses[-1].usage.prompt_tokens == len(expected)
+        return
+    generator = ExoBatchGenerator(
+        model=cast(Model, model), tokenizer=tokenizer, group=None, kv_prefix_cache=None
+    )
+    try:
+        identifier = generator.submit(task, prompt)
+        assert (
+            generator._active_tasks[identifier].all_prompt_tokens.tolist() == expected
+        )
+    finally:
+        generator._mlx_gen.close()
+
+
 def test_batch_step_uses_rank_zero_sample_on_every_distributed_rank(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

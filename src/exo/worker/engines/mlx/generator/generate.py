@@ -62,6 +62,7 @@ from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
     fix_unmatched_think_end_tokens,
     mx_barrier,
+    needs_v41_encoding,
     system_prompt_token_count,
 )
 from exo.worker.engines.mlx.vision import (
@@ -599,7 +600,8 @@ def mlx_generate(
 
     # Encode prompt once at the top and fix unmatched think tags
     all_prompt_tokens = encode_prompt(tokenizer, prompt)
-    all_prompt_tokens = fix_unmatched_think_end_tokens(all_prompt_tokens, tokenizer)
+    if not needs_v41_encoding(task):
+        all_prompt_tokens = fix_unmatched_think_end_tokens(all_prompt_tokens, tokenizer)
     min_prefix_hit_length = max(1000, system_prompt_token_count(task, tokenizer))
 
     vision: VisionResult | None = None

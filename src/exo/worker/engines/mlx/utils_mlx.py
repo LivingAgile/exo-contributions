@@ -561,7 +561,7 @@ def _needs_v4_encoding(task_params: TextGenerationTaskParams) -> bool:
     return re.search(r"deepseek-v4(?:-|$)", task_params.model.lower()) is not None
 
 
-def _needs_v41_encoding(task_params: TextGenerationTaskParams) -> bool:
+def needs_v41_encoding(task_params: TextGenerationTaskParams) -> bool:
     model = task_params.model.lower()
     return "deepseek-v4.1" in model or "deepseek_v41" in model
 
@@ -639,7 +639,7 @@ def render_chat_template(
     When chat_template_messages is available (from Chat Completions API),
     uses those directly to preserve tool_calls, thinking, and other fields.
     """
-    if _needs_v41_encoding(task_params):
+    if needs_v41_encoding(task_params):
         from exo.worker.engines.mlx.vendor.deepseek_v41_encoding import (
             encode_messages as encode_messages_v41,
         )

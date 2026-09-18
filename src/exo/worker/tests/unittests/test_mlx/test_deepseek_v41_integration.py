@@ -175,10 +175,10 @@ def test_v4_and_v41_encoding_identities_are_disjoint() -> None:
     v41_engram6 = SimpleNamespace(model=utils_mlx.DEEPSEEK_V41_ENGRAM6_MODEL_ID)
 
     assert utils_mlx._needs_v4_encoding(v4)  # type: ignore[arg-type]
-    assert not utils_mlx._needs_v41_encoding(v4)  # type: ignore[arg-type]
-    assert utils_mlx._needs_v41_encoding(v41)  # type: ignore[arg-type]
+    assert not utils_mlx.needs_v41_encoding(v4)  # type: ignore[arg-type]
+    assert utils_mlx.needs_v41_encoding(v41)  # type: ignore[arg-type]
     assert not utils_mlx._needs_v4_encoding(v41)  # type: ignore[arg-type]
-    assert utils_mlx._needs_v41_encoding(v41_engram6)  # type: ignore[arg-type]
+    assert utils_mlx.needs_v41_encoding(v41_engram6)  # type: ignore[arg-type]
     assert not utils_mlx._needs_v4_encoding(v41_engram6)  # type: ignore[arg-type]
     assert v41.model != v41_engram6.model
 

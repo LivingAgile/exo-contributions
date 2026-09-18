@@ -49,6 +49,7 @@ from exo.worker.engines.mlx.patches.opt_batch_gen import (
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     fix_unmatched_think_end_tokens,
+    needs_v41_encoding,
     system_prompt_token_count,
 )
 from exo.worker.engines.mlx.vision import (
@@ -145,9 +146,10 @@ class ExoBatchGenerator:
         on_generation_token: Callable[[], None] | None = None,
     ) -> int:
         all_prompt_tokens = encode_prompt(self.tokenizer, prompt)
-        all_prompt_tokens = fix_unmatched_think_end_tokens(
-            all_prompt_tokens, self.tokenizer
-        )
+        if not needs_v41_encoding(task_params):
+            all_prompt_tokens = fix_unmatched_think_end_tokens(
+                all_prompt_tokens, self.tokenizer
+            )
 
         vision: VisionResult | None = None
         media_regions: list[MediaRegion] = []
