@@ -332,14 +332,18 @@ class ExoBatchGenerator:
         insertion_tokens = (
             prompt_tokens if use_native_batch_prefill else prompt_tokens[-2:]
         )
-        _trace_deepseek_v41(
-            self.model,
-            "post_prefill",
-            cache_offsets=[int(c.offset) for c in cache],
-            prefix_hit_length=prefix_hit_length,
-            remaining_prompt_tokens=len(prompt_tokens),
-            insertion_tokens=cast(list[int], insertion_tokens.tolist()),
-        )
+        if (
+            _requires_single_sequence_batches(self.model)
+            and os.environ.get("MLX_LM_DEEPSEEK_V41_TRACE") == "1"
+        ):
+            _trace_deepseek_v41(
+                self.model,
+                "post_prefill",
+                cache_offsets=[int(c.offset) for c in cache],
+                prefix_hit_length=prefix_hit_length,
+                remaining_prompt_tokens=len(prompt_tokens),
+                insertion_tokens=cast(list[int], insertion_tokens.tolist()),
+            )
 
         logits_processors: list[Callable[[mx.array, mx.array], mx.array]] = (
             make_logits_processors(
