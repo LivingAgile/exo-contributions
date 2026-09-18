@@ -24,6 +24,85 @@ class _Group:
         return 2
 
 
+@pytest.mark.parametrize("distributed", [False, True])
+def test_loading_binds_tokenizer_before_returning_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, distributed: bool
+) -> None:
+    from mlx.utils import tree_flatten
+    from mlx_lm.models.llama import Model as LlamaModel
+    from mlx_lm.models.llama import ModelArgs as LlamaArgs
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    from exo.download import download_utils
+    from exo.shared.models.model_cards import ModelCard
+    from exo.shared.types.memory import Memory
+    from exo.shared.types.worker.shards import TensorShardMetadata
+
+    model_id = ModelId("test/tokenizer-binding")
+    model_path = tmp_path / model_id.normalize()
+    model_path.mkdir()
+    config = {
+        "model_type": "llama",
+        "hidden_size": 16,
+        "num_hidden_layers": 1,
+        "intermediate_size": 32,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "rms_norm_eps": 1e-5,
+        "vocab_size": 8,
+    }
+    (model_path / "config.json").write_text(json.dumps(config))
+    model = LlamaModel(LlamaArgs.from_dict(config))
+    mx.save_safetensors(
+        str(model_path / "model.safetensors"), dict(tree_flatten(model.parameters()))
+    )
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]")
+        ),
+        unk_token="[UNK]",
+    )
+    tokenizer.save_pretrained(model_path)
+    monkeypatch.setattr(download_utils, "EXO_MODELS_READ_ONLY_DIRS", [tmp_path])
+    monkeypatch.setattr(download_utils, "EXO_DEFAULT_MODELS_DIR", tmp_path)
+    monkeypatch.setattr(mx, "set_wired_limit", lambda limit: 0)
+    bound_tokenizers = []
+
+    def bind_tokenizer(self, loaded_tokenizer):
+        bound_tokenizers.append((self, loaded_tokenizer))
+
+    monkeypatch.setattr(LlamaModel, "bind_tokenizer", bind_tokenizer, raising=False)
+    card = ModelCard.model_construct(
+        model_id=model_id,
+        storage_size=Memory.from_bytes(1024),
+        n_layers=1,
+        hidden_size=16,
+        vision=None,
+        trust_remote_code=False,
+    )
+    shard = TensorShardMetadata(
+        model_card=card,
+        device_rank=0,
+        world_size=1,
+        start_layer=0,
+        end_layer=1,
+        n_layers=1,
+    )
+    bound = SimpleNamespace(bound_shard=shard, instance="test")
+    loader = utils_mlx.load_mlx_items(
+        bound, mx.distributed.init() if distributed else None
+    )
+    with pytest.raises(StopIteration) as completed:
+        while True:
+            next(loader)
+    loaded, loaded_tokenizer, vision = completed.value.value
+    assert bound_tokenizers == [(loaded, loaded_tokenizer)]
+    assert loaded_tokenizer.encode("hello") == [1]
+    assert vision is None
+
+
 def test_v41_load_is_strict_and_establishes_ownership_before_loading(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -50,9 +129,7 @@ def test_v41_load_is_strict_and_establishes_ownership_before_loading(
 def test_v41_engram6_load_injects_exact_checkpoint_profile(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    (tmp_path / "config.json").write_text(
-        json.dumps({"model_type": "deepseek_v41"})
-    )
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
     group = _Group()
     calls = []
 

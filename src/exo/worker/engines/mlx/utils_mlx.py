@@ -258,6 +258,9 @@ def load_mlx_items(
             f"Time taken to shard and load model: {(end_time - start_time):.2f}s"
         )
 
+    if hasattr(model, "bind_tokenizer"):
+        model.bind_tokenizer(tokenizer)
+
     mx.clear_cache()
 
     model_type = model.__class__.__module__
