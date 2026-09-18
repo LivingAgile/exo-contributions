@@ -12,6 +12,7 @@ Uses random weights — no model download required.
 
 import io
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import mlx.core as mx
@@ -30,6 +31,123 @@ from exo.worker.engines.mlx.generator.generate import prefill
 from exo.worker.engines.mlx.types import Model
 
 NUM_STEPS = 20
+
+
+def test_batch_step_uses_rank_zero_sample_on_every_distributed_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mlx_lm.models.llama import Model as LlamaModel
+    from mlx_lm.models.llama import ModelArgs
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    from exo.shared.types.text_generation import TextGenerationTaskParams
+    from exo.worker.engines.mlx.generator.batch_generate import (
+        ExoBatchGenerator,
+        _synchronize_sampler,
+    )
+    from exo.worker.engines.mlx.patches.opt_batch_gen import _patched_step
+
+    class Group:
+        def rank(self) -> int:
+            return 1
+
+        def size(self) -> int:
+            return 2
+
+    model = LlamaModel(
+        ModelArgs(
+            model_type="llama",
+            hidden_size=16,
+            num_hidden_layers=1,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            vocab_size=16,
+            rms_norm_eps=1e-5,
+        )
+    )
+    mx.eval(model.parameters())
+    gathered_inputs: list[list[int]] = []
+
+    def gather_peer_sample(sampled: mx.array, *, group: Group) -> mx.array:
+        gathered_inputs.append(cast(list[int], sampled.tolist()))
+        return mx.array([7, sampled.item()])
+
+    monkeypatch.setattr(mx.distributed, "all_gather", gather_peer_sample)
+    sampler = _synchronize_sampler(
+        lambda logprobs: mx.argmax(logprobs, axis=-1),
+        Group(),
+    )
+    batch = SimpleNamespace(
+        _current_tokens=None,
+        _current_logprobs=[],
+        _next_tokens=mx.array([5]),
+        _next_logprobs=[],
+        model=model,
+        prompt_cache=make_kv_cache(cast(Model, model)),
+        logits_processors=None,
+        samplers=None,
+        fallback_sampler=sampler,
+        tokens=[[]],
+        uids=[1],
+    )
+
+    emitted, _ = _patched_step(batch)
+
+    assert emitted == [5]
+    assert len(gathered_inputs) == 1
+    assert batch._next_tokens.tolist() == [7]
+
+    tokenizer = TokenizerWrapper(
+        PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(
+                WordLevel(
+                    {
+                        "[UNK]": 0,
+                        "hello": 1,
+                        "two": 2,
+                        "three": 3,
+                        "four": 4,
+                        "five": 5,
+                        "six": 6,
+                        "[EOS]": 7,
+                    },
+                    unk_token="[UNK]",
+                )
+            ),
+            unk_token="[UNK]",
+            eos_token="[EOS]",
+        )
+    )
+    generator = ExoBatchGenerator(
+        model=cast(Model, model),
+        tokenizer=tokenizer,
+        group=Group(),
+        kv_prefix_cache=None,
+    )
+    task = TextGenerationTaskParams.model_validate(
+        {
+            "model": "diagnostic/llama",
+            "input": [],
+            "max_output_tokens": 4,
+            "temperature": 0,
+        }
+    )
+    identifier = generator.submit(task, "hello")
+    responses = []
+    for _ in range(6):
+        responses.extend(generator.step())
+        if not generator.has_work:
+            break
+
+    assert len(responses) == 1
+    assert responses[0][0] == identifier
+    assert responses[0][1].token == 7
+    assert responses[0][1].finish_reason == "stop"
+    assert responses[0][1].usage is not None
+    assert not generator.has_work
 
 
 @pytest.mark.parametrize("needs_topk", [False, True])

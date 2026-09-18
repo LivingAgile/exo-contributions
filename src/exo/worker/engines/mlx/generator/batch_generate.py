@@ -91,6 +91,23 @@ class _EngineTask:
     last_gen_token_time: float | None = None
 
 
+def _synchronize_sampler(
+    sampler: Callable[[mx.array], mx.array],
+    group: mx.distributed.Group | None,
+) -> Callable[[mx.array], mx.array]:
+    if group is None or group.size() == 1:
+        return sampler
+
+    def synchronized(logprobs: mx.array) -> mx.array:
+        sampled = sampler(logprobs)
+        sampled_shape = sampled.shape
+        return mx.distributed.all_gather(sampled, group=group).reshape(
+            group.size(), *sampled_shape
+        )[0]
+
+    return synchronized
+
+
 @dataclass(eq=False)
 class ExoBatchGenerator:
     model: Model
@@ -192,6 +209,7 @@ class ExoBatchGenerator:
             min_p=task_params.min_p if task_params.min_p is not None else 0.05,
             top_k=task_params.top_k if task_params.top_k is not None else 0,
         )
+        sampler = _synchronize_sampler(sampler, self.group)
 
         vision_ctx = (
             patch_embed_tokens(
