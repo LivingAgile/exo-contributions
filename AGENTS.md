@@ -8,7 +8,14 @@ push feature branches, and integrate selected changes into
 `cluster-modelops/integration`. This includes public fork source needed for builds.
 Verify the exact push destination and inspect outgoing commits for secrets, private
 ancestry and unrelated material. Preserve licenses, attribution and the engineering
-checks below. Do not force-push, delete refs or change repository protections.
+checks below. Do not force-push or change repository protections. Agents may migrate
+verified agent-created Cluster Model Ops legacy branches into `cluster-modelops/`,
+carrying this policy and preserving every source commit and attribution. This grant
+also covers the legacy source names for migration only. Before deleting an original
+local or remote ref, publish and verify its replacement, record old/new names and
+SHAs for recovery, and check worktree, build, automation and PR dependencies. Retain
+refs with active work or unresolved consumers. Do not delete unrelated or upstream
+branches or alter main; uncertain ownership or safety requires the owner's decision.
 
 This is fork-development authority, not upstream-submission or deployment authority.
 Upstream issues, PRs, replies and readiness require separate authorization and the
