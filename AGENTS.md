@@ -1,5 +1,23 @@
 # AGENTS.md
 
+## LivingAgile Cluster Model Ops Scope
+
+On `LivingAgile/exo-contributions` branches under `cluster-modelops/`, agents acting
+for the owner may author code, tests, documentation and commit messages, commit and
+push feature branches, and integrate selected changes into
+`cluster-modelops/integration`. This includes public fork source needed for builds.
+Verify the exact push destination and inspect outgoing commits for secrets, private
+ancestry and unrelated material. Preserve licenses, attribution and the engineering
+checks below. Do not force-push, delete refs or change repository protections.
+
+This is fork-development authority, not upstream-submission or deployment authority.
+Upstream issues, PRs, replies and readiness require separate authorization and the
+target's contribution rules. Prepare upstream branches from clean upstream history;
+exclude this fork-only policy from both the diff and outgoing commits. Keep `main`
+as the upstream mirror. Pin builds to exact source revisions; advancing an integration
+branch does not activate it on the cluster. Owner authority: September 21, 2026,
+Local-AI-Strategy Plan 0056, session a2a61ca7.
+
 This file provides guidance to AI coding agents when working with code in this repository.
 
 ## Project Overview
