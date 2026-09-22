@@ -21,6 +21,7 @@ from exo.worker.runner.llm_inference.batch_generator import (
 from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
 
 from .cache import KVPrefixCache
+from .glm5_next import Model as FlashModel
 from .types import Model
 from .utils_mlx import (
     initialize_mlx,
@@ -83,7 +84,9 @@ class MlxBuilder(Builder):
         kv_prefix_cache = KVPrefixCache(self.group)
 
         device_rank = 0 if self.group is None else self.group.rank()
-        if os.environ.get("EXO_NO_BATCH"):
+        if os.environ.get("EXO_NO_BATCH") or isinstance(
+            self.inference_model, FlashModel
+        ):
             logger.info("using SequentialGenerator (batching disabled)")
             return SequentialGenerator(
                 model=self.inference_model,

@@ -15,6 +15,10 @@ let
         else if (builtins.elem "mlx-cuda12" members.exo or [ ]) then "mlx-cuda-12"
         else "mlx-cpu";
       python = pkgs.python313;
+      flashVlmSource = pkgs.fetchzip {
+        url = "https://github.com/Blaizzy/mlx-vlm/archive/83c3f54aedd31637819a02d6a277177db5547198.tar.gz";
+        hash = "sha256-OLUGhlPqFGbuxEMO2DBMTfJ7FhJAJ+RAl16bmnL+V8o=";
+      };
 
       cuda_cccl_compat = pkgs.runCommand "cuda-cccl-compat" { } ''
         mkdir -p $out/include
@@ -44,6 +48,30 @@ let
         paths = builtins.concatMap (p: [ (lib.getBin p) (lib.getLib p) (lib.getDev p) ]) (cudaLibs ++ [ cudaPackages.cuda_nvcc cuda_cccl_compat ]);
       };
       exoOverlay = final: prev: {
+        "mlx-lm" = prev."mlx-lm".overrideAttrs (old: {
+          postPatch = (old.postPatch or "") + ''
+            install -Dm644 ${../nix/muse-glimmer/mlx_lm/models/muse_glimmer.py} \
+              mlx_lm/models/muse_glimmer.py
+          '';
+        });
+
+        "mlx-vlm" = prev."mlx-vlm".overrideAttrs (old: {
+          postInstall = (old.postInstall or "") + ''
+            cp -R ${flashVlmSource}/mlx_vlm/. \
+              $out/${final.python.sitePackages}/mlx_vlm/
+            chmod -R u+w $out/${final.python.sitePackages}/mlx_vlm
+            install -Dm644 ${../nix/muse-glimmer/mlx_vlm/models/activations.py} \
+              $out/${final.python.sitePackages}/mlx_vlm/models/activations.py
+            install -Dm644 ${../nix/muse-glimmer/mlx_vlm/models/rope_utils.py} \
+              $out/${final.python.sitePackages}/mlx_vlm/models/rope_utils.py
+            install -Dm644 ${../nix/muse-glimmer/mlx_vlm/prompt_utils.py} \
+              $out/${final.python.sitePackages}/mlx_vlm/prompt_utils.py
+            mkdir -p $out/${final.python.sitePackages}/mlx_vlm/models/muse_glimmer
+            cp -R ${../nix/muse-glimmer/mlx_vlm/models/muse_glimmer}/. \
+              $out/${final.python.sitePackages}/mlx_vlm/models/muse_glimmer/
+          '';
+        });
+
         # Replace workspace exo_rs with Nix-built wheel.
         # Preserve passthru so mkVirtualEnv can resolve dependency groups.
         # Copy .pyi stub + py.typed marker so basedpyright can find the types.

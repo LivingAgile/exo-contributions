@@ -5,8 +5,10 @@ from inspect import signature
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import mlx.core as mx
-import mlx.nn as nn
+from mlx import nn
 from mlx.nn.layers.distributed import (
+    AllToShardedLinear,
+    ShardedToAllLinear,
     shard_inplace,
     shard_linear,
     sum_gradients,
@@ -33,6 +35,8 @@ from mlx_lm.models.llama import Model as LlamaModel
 from mlx_lm.models.minimax import MiniMaxAttention
 from mlx_lm.models.minimax import Model as MiniMaxModel
 from mlx_lm.models.ministral3 import Model as Ministral3Model
+from mlx_lm.models.muse_glimmer import Attention as MuseGlimmerAttention
+from mlx_lm.models.muse_glimmer import Model as MuseGlimmerModel
 from mlx_lm.models.nemotron_h import Model as NemotronHModel
 from mlx_lm.models.nemotron_h import (
     NemotronHAttention,
@@ -57,9 +61,12 @@ from mlx_lm.models.qwen3_next import (
 )
 from mlx_lm.models.qwen3_next import Qwen3NextModel as Qwen3NextInnerModel
 from mlx_lm.models.qwen3_vl import Model as Qwen3VLModel
+from mlx_lm.models.qwen4_exp import Model as Qwen4ExpModel
+from mlx_lm.models.qwen4_exp import SparseMoeBlock as Qwen4ExpSparseMoeBlock
 from mlx_lm.models.step3p5 import Model as Step35Model
 from mlx_lm.models.step3p5 import Step3p5MLP as Step35MLP
 from mlx_lm.models.step3p5 import Step3p5Model as Step35InnerModel
+from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
 from exo.shared.types.worker.runner_response import ModelLoadingResponse
 from exo.shared.types.worker.shards import PipelineShardMetadata
@@ -70,6 +77,30 @@ if TYPE_CHECKING:
 
 
 _pending_prefill_sends: list[tuple[mx.array, int, mx.distributed.Group]] = []
+
+_GLM_MOE_DSA_FULL_INDEXER_LAYERS = (
+    0,
+    1,
+    2,
+    6,
+    10,
+    14,
+    18,
+    22,
+    26,
+    30,
+    34,
+    38,
+    42,
+    46,
+    50,
+    54,
+    58,
+    62,
+    66,
+    70,
+    74,
+)
 
 
 def flush_prefill_sends() -> None:
@@ -93,6 +124,77 @@ class _LayerCallable(Protocol):
     """
 
     def __call__(self, x: mx.array, *args: object, **kwargs: object) -> mx.array: ...
+
+
+class _GlmNorm(Protocol):
+    eps: float
+
+
+class _GlmHeadBank(Protocol):
+    def apply(self, fn: Callable[[mx.array], mx.array]) -> None: ...
+
+
+class _GlmIndexer(Protocol):
+    wq_b: nn.Module
+    wk: nn.Module
+    k_norm: _GlmNorm
+    weights_proj: nn.Module
+
+
+class _GlmAttention(Protocol):
+    q_a_proj: nn.Module
+    q_b_proj: nn.Module
+    kv_a_proj_with_mqa: nn.Module
+    o_proj: nn.Module
+    embed_q: _GlmHeadBank
+    unembed_out: _GlmHeadBank
+    num_heads: int
+    indexer: _GlmIndexer | None
+
+
+class _GlmProjectionSet(Protocol):
+    gate_proj: nn.Module
+    up_proj: nn.Module
+    down_proj: nn.Module
+
+
+class _GlmGate(Protocol):
+    weight: mx.array
+    e_score_correction_bias: mx.array
+
+
+class _GlmMoe(Protocol):
+    shared_experts: _GlmProjectionSet
+    switch_mlp: _GlmProjectionSet
+    gate: _GlmGate
+    sharding_group: mx.distributed.Group | None
+
+
+class _GlmLayer(Protocol):
+    self_attn: _GlmAttention
+    mlp: nn.Module
+
+
+class _GlmArgs(Protocol):
+    indexer_types: list[str]
+
+
+class _GlmInnerModel(Protocol):
+    embed_tokens: nn.Module
+    layers: list[_GlmLayer]
+    norm: nn.Module
+
+
+class _GlmCacheList(Protocol):
+    caches: list[object]
+
+
+class _GlmModel(Protocol):
+    args: _GlmArgs
+    model: _GlmInnerModel
+    lm_head: nn.Module
+
+    def make_cache(self) -> list[_GlmCacheList]: ...
 
 
 class CustomMlxLayer(nn.Module):
@@ -497,8 +599,48 @@ def tensor_auto_parallel(
         group=group,
     )
 
+    if type(model).__module__ == "exo.worker.engines.mlx.glm5_next":
+        from mlx_vlm.models.glm5_next.language import Glm5NextMoE
+
+        from exo.worker.engines.mlx.glm5_next import Model as FlashModel
+
+        if not isinstance(model, FlashModel):
+            raise TypeError("Unexpected Flash adapter type")
+        for layer in model.layers:
+            if not isinstance(layer.mlp, Glm5NextMoE):
+                continue
+            shared = layer.mlp.shared_experts
+            width = cast(mx.array, shared.gate_up_proj["weight"]).shape[0] // 2
+            group_size = getattr(shared.down_proj, "group_size", 1)
+            if width % (n * group_size):
+                raise ValueError(
+                    "Flash shared intermediate must align with rank quantization groups"
+                )
+        for index, layer in enumerate(model.layers):
+            if isinstance(layer.mlp, Glm5NextMoE):
+                mixture = layer.mlp
+                segments = 2
+                all_to_sharded_linear_in_place(mixture.shared_experts.gate_up_proj)
+                segments = 1
+                sharded_to_all_linear_in_place(mixture.shared_experts.down_proj)
+                all_to_sharded_linear_in_place(mixture.switch_mlp.gate_proj)
+                all_to_sharded_linear_in_place(mixture.switch_mlp.up_proj)
+                sharded_to_all_linear_in_place(mixture.switch_mlp.down_proj)
+                mixture.sharding_group = group
+            mx.eval(layer.parameters())
+            mx.clear_cache()
+            yield ModelLoadingResponse(layers_loaded=index, total=len(model.layers))
+        return model
     if isinstance(model, (LlamaModel, Ministral3Model)):
         tensor_parallel_sharding_strategy = LlamaShardingStrategy(
+            group,
+            all_to_sharded_linear,
+            sharded_to_all_linear,
+            all_to_sharded_linear_in_place,
+            sharded_to_all_linear_in_place,
+        )
+    elif isinstance(model, MuseGlimmerModel):
+        tensor_parallel_sharding_strategy = MuseGlimmerShardingStrategy(
             group,
             all_to_sharded_linear,
             sharded_to_all_linear,
@@ -539,6 +681,14 @@ def tensor_auto_parallel(
         )
     elif isinstance(model, Glm4MoeModel):
         tensor_parallel_sharding_strategy = Glm4MoeShardingStrategy(
+            group,
+            all_to_sharded_linear,
+            sharded_to_all_linear,
+            all_to_sharded_linear_in_place,
+            sharded_to_all_linear_in_place,
+        )
+    elif isinstance(model, Qwen4ExpModel):
+        tensor_parallel_sharding_strategy = Qwen4ExpShardingStrategy(
             group,
             all_to_sharded_linear,
             sharded_to_all_linear,
@@ -589,6 +739,14 @@ def tensor_auto_parallel(
         )
     elif isinstance(model, Gemma4Model):
         tensor_parallel_sharding_strategy = Gemma4ShardingStrategy(
+            group,
+            all_to_sharded_linear,
+            sharded_to_all_linear,
+            all_to_sharded_linear_in_place,
+            sharded_to_all_linear_in_place,
+        )
+    elif _is_bundled_glm_moe_dsa(model):
+        tensor_parallel_sharding_strategy = GlmMoeDsaShardingStrategy(
             group,
             all_to_sharded_linear,
             sharded_to_all_linear,
@@ -649,6 +807,110 @@ class LlamaShardingStrategy(TensorParallelShardingStrategy):
             mx.eval(layer)
 
             yield ModelLoadingResponse(layers_loaded=i, total=total)
+        return model
+
+
+def _shard_muse_attention_heads(
+    attention: MuseGlimmerAttention,
+    group: mx.distributed.Group,
+) -> None:
+    n_heads = attention.n_heads
+    n_kv_heads = attention.n_kv_heads
+    head_dim = attention.head_dim
+    world_size = group.size()
+    rank = group.rank()
+
+    if n_heads % n_kv_heads != 0:
+        raise ValueError("Muse query heads must be divisible by KV heads")
+    heads_per_kv = n_heads // n_kv_heads
+    if heads_per_kv % world_size != 0:
+        raise ValueError(
+            f"Muse query heads per KV group ({heads_per_kv}) must be divisible "
+            f"by world size ({world_size})"
+        )
+
+    heads_per_rank = heads_per_kv // world_size
+    start = rank * heads_per_rank
+    end = start + heads_per_rank
+
+    def shard_rows(linear: nn.Module) -> AllToShardedLinear:
+        if not isinstance(linear, nn.Linear):
+            raise TypeError("Muse BF16 attention requires dense linear projections")
+        output_dims, input_dims = linear.weight.shape
+        expected_output_dims = n_heads * head_dim
+        if output_dims != expected_output_dims:
+            raise ValueError(
+                f"Muse attention projection output must be {expected_output_dims}, "
+                f"got {output_dims}"
+            )
+        weight = linear.weight.reshape(n_kv_heads, heads_per_kv, head_dim, input_dims)[
+            :, start:end
+        ].reshape(n_kv_heads * heads_per_rank * head_dim, input_dims)
+        sharded = AllToShardedLinear(
+            input_dims,
+            output_dims,
+            bias="bias" in linear,
+            group=group,
+        )
+        sharded.weight = mx.contiguous(weight)
+        if "bias" in linear and linear.bias is not None:
+            sharded.bias = mx.contiguous(
+                linear.bias.reshape(n_kv_heads, heads_per_kv, head_dim)[
+                    :, start:end
+                ].reshape(-1)
+            )
+        return sharded
+
+    def shard_columns(linear: nn.Module) -> ShardedToAllLinear:
+        if not isinstance(linear, nn.Linear):
+            raise TypeError("Muse BF16 attention requires dense linear projections")
+        output_dims, input_dims = linear.weight.shape
+        expected_input_dims = n_heads * head_dim
+        if input_dims != expected_input_dims:
+            raise ValueError(
+                f"Muse attention output input must be {expected_input_dims}, "
+                f"got {input_dims}"
+            )
+        weight = linear.weight.reshape(output_dims, n_kv_heads, heads_per_kv, head_dim)[
+            :, :, start:end
+        ].reshape(output_dims, n_kv_heads * heads_per_rank * head_dim)
+        sharded = ShardedToAllLinear(
+            input_dims,
+            output_dims,
+            bias="bias" in linear,
+            group=group,
+        )
+        sharded.weight = mx.contiguous(weight)
+        if "bias" in linear:
+            sharded.bias = linear.bias
+        return sharded
+
+    _ = attention.update_modules(
+        {
+            "q_proj": shard_rows(attention.q_proj),
+            "gate_proj": shard_rows(attention.gate_proj),
+            "o_proj": shard_columns(attention.o_proj),
+        }
+    )
+    attention.n_heads = n_kv_heads * heads_per_rank
+
+
+class MuseGlimmerShardingStrategy(TensorParallelShardingStrategy):
+    def shard_model(
+        self,
+        model: nn.Module,
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
+        model = cast(MuseGlimmerModel, model)
+        total = len(model.layers)
+        for index, layer in enumerate(model.layers):
+            mx.eval(layer.parameters())
+            _shard_muse_attention_heads(layer.self_attn, self.group)
+            layer.mlp.gate_proj = self.all_to_sharded_linear(layer.mlp.gate_proj)
+            layer.mlp.down_proj = self.sharded_to_all_linear(layer.mlp.down_proj)
+            layer.mlp.up_proj = self.all_to_sharded_linear(layer.mlp.up_proj)
+            mx.eval(layer)
+            mx.clear_cache()
+            yield ModelLoadingResponse(layers_loaded=index, total=total)
         return model
 
 
@@ -747,6 +1009,178 @@ class DeepSeekShardingStrategy(TensorParallelShardingStrategy):
             mx.eval(layer)
 
             yield ModelLoadingResponse(layers_loaded=i, total=total)
+
+        return model
+
+
+def _is_bundled_glm_moe_dsa(model: nn.Module) -> bool:
+    return (
+        getattr(model, "model_type", None) == "glm_moe_dsa"
+        and type(model).__module__ == "custom_model"
+    )
+
+
+def _require_attributes(value: object, path: str, names: tuple[str, ...]) -> None:
+    missing = [name for name in names if not hasattr(value, name)]
+    if missing:
+        raise ValueError(f"{path} is missing required attributes: {', '.join(missing)}")
+
+
+def _validate_glm_moe_dsa_model(
+    model: nn.Module,
+    world_size: int,
+) -> tuple[list[_GlmLayer], list[bool]]:
+    if not _is_bundled_glm_moe_dsa(model):
+        raise ValueError("GLM DSA Tensor strategy requires bundled custom_model.Model")
+
+    _require_attributes(model, "model", ("args", "model", "lm_head", "make_cache"))
+    custom_model = cast(_GlmModel, cast(object, model))
+    args = custom_model.args
+    inner = custom_model.model
+    _require_attributes(inner, "model.model", ("embed_tokens", "layers", "norm"))
+    layers = list(inner.layers)
+    if len(layers) != 78:
+        raise ValueError(f"glm_moe_dsa requires exactly 78 layers, got {len(layers)}")
+
+    expected_types = [
+        "full" if index in _GLM_MOE_DSA_FULL_INDEXER_LAYERS else "shared"
+        for index in range(78)
+    ]
+    if list(getattr(args, "indexer_types", [])) != expected_types:
+        raise ValueError("glm_moe_dsa indexer_types do not match the 21/57 schedule")
+
+    caches = custom_model.make_cache()
+    if len(caches) != len(layers):
+        raise ValueError("glm_moe_dsa cache count must match its active layer count")
+
+    dense_layers: list[bool] = []
+    projection_names = ("gate_proj", "up_proj", "down_proj")
+    for index, (layer, indexer_type, cache) in enumerate(
+        zip(layers, expected_types, caches, strict=True)
+    ):
+        layer_path = f"model.layers.{index}"
+        _require_attributes(layer, layer_path, ("self_attn", "mlp"))
+        attention = layer.self_attn
+        _require_attributes(
+            attention,
+            f"{layer_path}.self_attn",
+            (
+                "q_a_proj",
+                "q_b_proj",
+                "kv_a_proj_with_mqa",
+                "o_proj",
+                "embed_q",
+                "unembed_out",
+                "num_heads",
+                "indexer",
+            ),
+        )
+        if attention.num_heads % world_size != 0:
+            raise ValueError(
+                f"{layer_path}.self_attn.num_heads must be divisible by {world_size}"
+            )
+
+        if indexer_type == "full":
+            indexer = attention.indexer
+            if indexer is None:
+                raise ValueError(f"full layer {index} must define an indexer")
+            _require_attributes(
+                indexer,
+                f"{layer_path}.self_attn.indexer",
+                ("wq_b", "wk", "k_norm", "weights_proj"),
+            )
+            if indexer.k_norm.eps != 1e-6:
+                raise ValueError(f"full layer {index} indexer k_norm must use eps=1e-6")
+        elif attention.indexer is not None:
+            raise ValueError(f"shared layer {index} must not define an indexer")
+        expected_cache_count = 2 if indexer_type == "full" else 1
+        cache_count = len(getattr(cache, "caches", ()))
+        if cache_count != expected_cache_count:
+            raise ValueError(
+                f"{layer_path} must create {expected_cache_count} cache entries"
+            )
+
+        mlp = layer.mlp
+        is_dense = all(hasattr(mlp, name) for name in projection_names)
+        is_moe = all(
+            hasattr(mlp, name)
+            for name in ("shared_experts", "switch_mlp", "gate", "sharding_group")
+        )
+        expected_dense = index < 3
+        if is_dense != expected_dense or is_moe == expected_dense:
+            expected_kind = "dense" if expected_dense else "MoE"
+            raise ValueError(f"{layer_path}.mlp must have {expected_kind} structure")
+        if is_dense:
+            _require_attributes(mlp, f"{layer_path}.mlp", projection_names)
+        else:
+            moe = cast(_GlmMoe, cast(object, mlp))
+            _require_attributes(
+                moe.shared_experts,
+                f"{layer_path}.mlp.shared_experts",
+                projection_names,
+            )
+            _require_attributes(
+                moe.switch_mlp,
+                f"{layer_path}.mlp.switch_mlp",
+                projection_names,
+            )
+            _require_attributes(
+                moe.gate,
+                f"{layer_path}.mlp.gate",
+                ("weight", "e_score_correction_bias"),
+            )
+        dense_layers.append(is_dense)
+
+    return layers, dense_layers
+
+
+class GlmMoeDsaShardingStrategy(TensorParallelShardingStrategy):
+    def shard_model(
+        self,
+        model: nn.Module,
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
+        layers, dense_layers = _validate_glm_moe_dsa_model(model, self.N)
+        total = len(layers)
+        for index, (layer, is_dense) in enumerate(
+            zip(layers, dense_layers, strict=True)
+        ):
+            layer_module = cast(nn.Module, cast(object, layer))
+            mx.eval(layer_module.parameters())
+            attention = layer.self_attn
+            attention.q_b_proj = self.all_to_sharded_linear(attention.q_b_proj)
+            attention.o_proj = self.sharded_to_all_linear(attention.o_proj)
+            attention.num_heads //= self.N
+            start_head = self.group.rank() * attention.num_heads
+            end_head = start_head + attention.num_heads
+
+            def shard_heads(
+                weight: mx.array,
+                start: int = start_head,
+                end: int = end_head,
+            ) -> mx.array:
+                return weight[start:end]
+
+            attention.embed_q.apply(shard_heads)
+            attention.unembed_out.apply(shard_heads)
+
+            if is_dense:
+                mlp = cast(_GlmProjectionSet, cast(object, layer.mlp))
+                mlp.gate_proj = self.all_to_sharded_linear(mlp.gate_proj)
+                mlp.down_proj = self.sharded_to_all_linear(mlp.down_proj)
+                mlp.up_proj = self.all_to_sharded_linear(mlp.up_proj)
+            else:
+                mlp = cast(_GlmMoe, cast(object, layer.mlp))
+                self.all_to_sharded_linear_in_place(mlp.shared_experts.gate_proj)
+                self.sharded_to_all_linear_in_place(mlp.shared_experts.down_proj)
+                self.all_to_sharded_linear_in_place(mlp.shared_experts.up_proj)
+                self.all_to_sharded_linear_in_place(mlp.switch_mlp.gate_proj)
+                self.sharded_to_all_linear_in_place(mlp.switch_mlp.down_proj)
+                self.all_to_sharded_linear_in_place(mlp.switch_mlp.up_proj)
+                mlp.sharding_group = self.group
+
+            mx.eval(layer_module)
+            mx.clear_cache()
+            yield ModelLoadingResponse(layers_loaded=index, total=total)
 
         return model
 
@@ -1279,6 +1713,106 @@ class QwenShardingStrategy(TensorParallelShardingStrategy):
             mx.eval(layer)
             mx.clear_cache()
 
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
+        return model
+
+
+class Qwen4ExpShardingStrategy(TensorParallelShardingStrategy):
+    def _shard_mlp(
+        self,
+        gate_proj: nn.Module,
+        down_proj: nn.Module,
+        up_proj: nn.Module,
+    ) -> None:
+        quantized_linear_types = (nn.QuantizedLinear, QuantizedSwitchLinear)
+        if not isinstance(down_proj, quantized_linear_types):
+            self.all_to_sharded_linear_in_place(gate_proj)
+            self.sharded_to_all_linear_in_place(down_proj)
+            self.all_to_sharded_linear_in_place(up_proj)
+            return
+
+        if not isinstance(gate_proj, quantized_linear_types) or not isinstance(
+            up_proj, quantized_linear_types
+        ):
+            raise TypeError("Qwen4Exp MoE projections must share quantization")
+
+        down_scales = cast(mx.array, down_proj.scales)
+        quantization_groups: int = down_scales.shape[-1]
+        if quantization_groups % self.N == 0:
+            self.all_to_sharded_linear_in_place(gate_proj)
+            self.sharded_to_all_linear_in_place(down_proj)
+            self.all_to_sharded_linear_in_place(up_proj)
+            return
+
+        if quantization_groups < self.N:
+            raise ValueError(
+                "Qwen4Exp quantized MoE has fewer quantization groups than ranks"
+            )
+
+        groups_per_rank, extra_groups = divmod(quantization_groups, self.N)
+        rank = self.group.rank()
+        group_start = rank * groups_per_rank + min(rank, extra_groups)
+        group_count = groups_per_rank + int(rank < extra_groups)
+        group_end = group_start + group_count
+        group_size = cast(int, down_proj.group_size)
+        bits = cast(int, down_proj.bits)
+        logical_start = group_start * group_size
+        logical_end = group_end * group_size
+        packed_per_group = group_size * bits // 32
+        packed_start = group_start * packed_per_group
+        packed_end = group_end * packed_per_group
+
+        for projection in (gate_proj, up_proj):
+            weight = cast(mx.array, projection.weight)
+            scales = cast(mx.array, projection.scales)
+            projection.weight = mx.contiguous(weight[..., logical_start:logical_end, :])
+            projection.scales = mx.contiguous(scales[..., logical_start:logical_end, :])
+            projection_biases = projection.get("biases")
+            if isinstance(projection_biases, mx.array):
+                projection.biases = mx.contiguous(
+                    projection_biases[..., logical_start:logical_end, :]
+                )
+            projection_bias = projection.get("bias")
+            if isinstance(projection_bias, mx.array):
+                projection.bias = mx.contiguous(
+                    projection_bias[..., logical_start:logical_end]
+                )
+
+        down_weight = cast(mx.array, down_proj.weight)
+        down_proj.weight = mx.contiguous(down_weight[..., packed_start:packed_end])
+        down_proj.scales = mx.contiguous(down_scales[..., group_start:group_end])
+        down_biases = down_proj.get("biases")
+        if isinstance(down_biases, mx.array):
+            down_proj.biases = mx.contiguous(down_biases[..., group_start:group_end])
+        down_bias = down_proj.get("bias")
+        if isinstance(down_bias, mx.array):
+            down_proj.bias = down_bias / self.N
+
+    def shard_model(
+        self,
+        model: nn.Module,
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
+        model = cast(Qwen4ExpModel, model)
+        total = len(model.layers)
+        for i, layer in enumerate(model.layers):
+            mx.eval(layer.parameters())
+
+            assert isinstance(layer.mlp, Qwen4ExpSparseMoeBlock)
+            self._shard_mlp(
+                layer.mlp.switch_mlp.gate_proj,
+                layer.mlp.switch_mlp.down_proj,
+                layer.mlp.switch_mlp.up_proj,
+            )
+            self._shard_mlp(
+                layer.mlp.shared_expert.gate_proj,
+                layer.mlp.shared_expert.down_proj,
+                layer.mlp.shared_expert.up_proj,
+            )
+            layer.mlp = ShardedMoE(layer.mlp)  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
+            layer.mlp.sharding_group = self.group
+
+            mx.eval(layer)
+            mx.clear_cache()
             yield ModelLoadingResponse(layers_loaded=i, total=total)
         return model
 

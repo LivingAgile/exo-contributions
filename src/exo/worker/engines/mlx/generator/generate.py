@@ -56,6 +56,7 @@ from exo.worker.engines.mlx.constants import (
     MAX_TOKENS,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
+from exo.worker.engines.mlx.glm5_next import Model as FlashModel
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
@@ -331,7 +332,7 @@ def prefill(
 
     is_pipeline = _has_pipeline_communication_layer(model)
 
-    prefill_step_size = 4096
+    prefill_step_size = 512 if isinstance(model, FlashModel) else 4096
 
     try:
         if is_pipeline and num_tokens >= prefill_step_size:

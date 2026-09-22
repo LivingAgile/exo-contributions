@@ -109,6 +109,24 @@ def _instantiate_projector(
     return cls(**kwargs)  # type: ignore
 
 
+class _MuseVisionProjector(nn.Module):
+    def __init__(
+        self,
+        adapter: nn.Module,
+        projection: nn.Module,
+        normalization: nn.Module,
+    ):
+        super().__init__()
+        self.vision_adapter = adapter
+        self.vision_projection = projection
+        self.perception_emb_norm = normalization
+
+    def __call__(self, hidden_states: mx.array) -> mx.array:
+        hidden_states = self.vision_adapter(hidden_states)
+        hidden_states = self.vision_projection(hidden_states)
+        return self.perception_emb_norm(hidden_states)
+
+
 def _patch_video_processor() -> None:
     """Patch so we don't crash horribly when torch vision isn't installed"""
     # TODO: Update if we add torch vision.
@@ -297,7 +315,31 @@ class VisionEncoder:
             model_mod = self._import_mlx_vlm(self._config.model_type)  # type: ignore
 
         projector_cls = None
-        if model_mod is not None:
+        if self._config.model_type == "muse_glimmer" and model_mod is not None:
+            text_config = config_mod.TextConfig(  # type: ignore
+                **_filter_config(config_mod.TextConfig, config.get("text_config", {}))  # type: ignore
+            )
+            extra = {
+                k: v
+                for k, v in config.items()  # type: ignore
+                if k not in ("text_config", "vision_config")
+            }
+            extra.setdefault("model_type", self._config.model_type)
+            model_config = config_mod.ModelConfig(  # type: ignore
+                text_config=text_config,
+                vision_config=vision_config,
+                **_filter_config(config_mod.ModelConfig, extra),  # type: ignore
+            )
+            self._projector = _MuseVisionProjector(
+                model_mod.VisionAdapter(model_config),  # type: ignore
+                nn.Linear(
+                    model_config.projector_hidden_size,  # type: ignore
+                    text_config.hidden_size,  # type: ignore
+                    bias=False,
+                ),
+                model_mod.RMSNormNoScale(text_config.rms_norm_eps),  # type: ignore
+            )
+        elif model_mod is not None:
             for attr_name in dir(model_mod):  # type: ignore
                 obj = getattr(model_mod, attr_name)  # type: ignore
                 if (
@@ -424,12 +466,21 @@ class VisionEncoder:
         if not safetensors_files:
             raise FileNotFoundError(f"No safetensors files found in {self._model_path}")
 
-        vision_prefixes = ["vision_tower.", "model.visual."]
+        vision_prefixes = [
+            "vision_tower.",
+            "model.vision_tower.",
+            "model.visual.",
+        ]
         projector_prefixes = [
             "embed_vision.",
             "multi_modal_projector.",
             "mm_projector.",
         ]
+        muse_projector_prefixes = {
+            "model.vision_adapter.": "vision_adapter.",
+            "model.vision_projection.": "vision_projection.",
+            "model.perception_emb_norm.": "perception_emb_norm.",
+        }
         vision_weights: dict[str, mx.array] = {}
         projector_weights: dict[str, mx.array] = {}
 
@@ -453,6 +504,16 @@ class VisionEncoder:
                             break
                     if matched:
                         continue
+                    if self._config.model_type == "muse_glimmer":
+                        for prefix, replacement in muse_projector_prefixes.items():
+                            if key.startswith(prefix):
+                                projector_weights[replacement + key[len(prefix) :]] = (
+                                    _torch_tensor_to_mx(f.get_tensor(key))
+                                )
+                                matched = True
+                                break
+                    if matched:
+                        continue
                     for prefix in projector_prefixes:
                         if key.startswith(prefix):
                             projector_weights[key[len(prefix) :]] = _torch_tensor_to_mx(
@@ -465,6 +526,18 @@ class VisionEncoder:
                 f"No vision weights found with prefixes {vision_prefixes} in {self._model_path}. "
                 "Ensure the model repo contains bundled vision weights."
             )
+        if self._config.model_type == "muse_glimmer":
+            required_projector_weights = {
+                "vision_adapter.fc1.weight",
+                "vision_adapter.fc2.weight",
+                "vision_projection.weight",
+            }
+            missing = required_projector_weights - projector_weights.keys()
+            if missing:
+                raise ValueError(
+                    "Missing required Muse vision projection weights: "
+                    + ", ".join(sorted(missing))
+                )
 
         assert self._vision_tower is not None
         if needs_sanitize:
@@ -579,15 +652,18 @@ class VisionEncoder:
                 stacked = mx.array(raw_pixel_values)
                 per_image_pixels = [stacked[i : i + 1] for i in range(stacked.shape[0])]
 
-        patch_embed_weight = None
+        tower = self._vision_tower
+        patch_weight = None
         with contextlib.suppress(AttributeError):
-            patch_embed_weight = self._vision_tower.patch_embed.proj.weight  # type: ignore
+            patch_weight = tower.patch_embed.proj.weight  # type: ignore
         with contextlib.suppress(AttributeError):
-            patch_embed_weight = self._vision_tower.patch_embedder.input_proj.weight  # type: ignore
-        assert patch_embed_weight is not None, (
+            patch_weight = tower.patch_embedder.input_proj.weight  # type: ignore
+        with contextlib.suppress(AttributeError):
+            patch_weight = tower.patch_embedder.patch_embedding.weight  # type: ignore
+        assert patch_weight is not None, (
             "vision tower has no recognised patch-embedding linear"
         )
-        tower_dtype = cast(mx.Dtype, patch_embed_weight.dtype)
+        tower_dtype = cast(mx.Dtype, patch_weight.dtype)
 
         if self._needs_nhwc:
             assert grid_thw is not None

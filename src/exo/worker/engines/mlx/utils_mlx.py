@@ -147,6 +147,59 @@ def mlx_distributed_init(
         return group
 
 
+def load_model_for_exo(model_path: Path) -> tuple[nn.Module, dict[str, Any]]:
+    config = cast(dict[str, Any], json.loads((model_path / "config.json").read_text()))
+    if config.get("model_type") == "glm5_next":
+        from exo.worker.engines.mlx.glm5_next import Model as FlashModel
+        from exo.worker.engines.mlx.glm5_next import ModelArgs as FlashModelArgs
+
+        quantization = config.get("quantization")
+        overrides: dict[str, Any] = {"model_file": None}
+        if isinstance(quantization, dict):
+            quantization = cast(dict[str, object], quantization)
+            mapped_quantization = {
+                "language_model." + name
+                if name.startswith(("model.", "lm_head."))
+                else name: value
+                for name, value in quantization.items()
+            }
+            defaults = {
+                name: quantization[name]
+                for name in ("bits", "group_size", "mode")
+                if name in quantization
+            }
+            for name in list(mapped_quantization):
+                if name.endswith((".mlp.gate_proj", ".shared_experts.gate_proj")):
+                    up_name = name.removesuffix("gate_proj") + "up_proj"
+                    gate_settings = mapped_quantization[name]
+                    up_settings = mapped_quantization.get(up_name, defaults)
+                    if gate_settings != up_settings:
+                        raise ValueError(f"Incompatible fused quantization: {name}")
+                    mapped_quantization[
+                        name.removesuffix("gate_proj") + "gate_up_proj"
+                    ] = gate_settings
+            overrides["quantization"] = mapped_quantization
+        return load_model(
+            model_path,
+            lazy=True,
+            strict=True,
+            model_config=overrides,
+            get_model_classes=lambda config: (FlashModel, FlashModelArgs),
+        )
+    if config.get("model_type") == "qwen4_exp":
+        return load_model(
+            model_path,
+            lazy=True,
+            strict=True,
+            model_config={"model_file": None},
+        )
+    if config.get("model_type") == "glm_moe_dsa":
+        if config.get("model_file") != "glm_moe_dsa.py":
+            raise ValueError("glm_moe_dsa requires the bundled glm_moe_dsa.py runtime")
+        return load_model(model_path, lazy=True, strict=True)
+    return load_model(model_path, lazy=True, strict=False)
+
+
 def initialize_mlx(
     bound_instance: BoundInstance,
 ) -> mx.distributed.Group:
@@ -172,7 +225,7 @@ def load_mlx_items(
         logger.info(f"Single device used for {bound_instance.instance}")
         model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
         start_time = time.perf_counter()
-        model, _ = load_model(model_path, lazy=True, strict=False)
+        model, _ = load_model_for_exo(model_path)
         # Eval layers one by one for progress reporting
         try:
             inner = get_inner_model(model)
@@ -235,7 +288,7 @@ def shard_and_load(
 ) -> Generator[ModelLoadingResponse, None, tuple[nn.Module, TokenizerWrapper]]:
     model_path = build_model_path(shard_metadata.model_card.model_id)
 
-    model, _ = load_model(model_path, lazy=True, strict=False)
+    model, _ = load_model_for_exo(model_path)
     logger.debug(model)
     if hasattr(model, "model") and isinstance(model.model, DeepseekV3Model):  # type: ignore
         pass
@@ -311,6 +364,8 @@ def get_eos_token_ids_for_model(model_id: ModelId) -> list[int] | None:
     model_id_lower = model_id.lower()
     if "kimi-k2" in model_id_lower:
         return [163586]
+    elif "muse-glimmer" in model_id_lower:
+        return [200001, 200008]
     elif "glm-5" in model_id_lower:
         # 154820: <|endoftext|>, 154827: <|user|>, 154829: <|observation|>
         return [154820, 154827, 154829]

@@ -144,8 +144,8 @@ async def chat_request_to_text_generation(
             dumped: dict[str, Any] = msg_copy.model_dump(exclude_none=True)
             chat_template_messages.append(dumped)
 
-    resolved_effort, resolved_thinking = resolve_reasoning_params(
-        request.reasoning_effort, request.enable_thinking
+    resolved_effort, resolved_thinking = await resolve_reasoning_params(
+        request.reasoning_effort, request.enable_thinking, request.model
     )
 
     return TextGenerationTaskParams(

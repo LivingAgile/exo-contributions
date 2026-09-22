@@ -4441,7 +4441,7 @@ def save_safetensors(
     file: str | pathlib.Path,
     arrays: dict[str, array],
     metadata: dict[str, str] | None = ...,
-):
+) -> None:
     """
     Save array(s) to a binary file in ``.safetensors`` format.
 

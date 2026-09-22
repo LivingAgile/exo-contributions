@@ -32,16 +32,29 @@ ReasoningDialect = Literal[
 ]
 
 
-def resolve_reasoning_params(
+async def resolve_reasoning_params(
     reasoning_effort: ReasoningEffort | None,
     enable_thinking: bool | None,
+    model: ModelId | None = None,
 ) -> tuple[ReasoningEffort | None, bool | None]:
     """
+    An omitted effort uses the cached card default, then the built-in default.
     enable_thinking=True  -> reasoning_effort="medium"
     enable_thinking=False -> reasoning_effort="none"
     reasoning_effort="none" -> enable_thinking=False
     reasoning_effort=<anything else> -> enable_thinking=True
     """
+    if reasoning_effort is None and enable_thinking is not False and model is not None:
+        from exo.shared.models import model_cards
+
+        card = model_cards.card_cache.get(model)
+        if card is not None:
+            reasoning_effort = card.default_reasoning_effort
+        if reasoning_effort is None:
+            builtin = await model_cards.load_builtin_model_card(model)
+            if builtin is not None:
+                reasoning_effort = builtin.default_reasoning_effort
+
     resolved_effort: ReasoningEffort | None = reasoning_effort
     resolved_thinking: bool | None = enable_thinking
 

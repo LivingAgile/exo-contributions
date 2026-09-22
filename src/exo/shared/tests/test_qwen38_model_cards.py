@@ -1,8 +1,40 @@
 import pytest
 
-from exo.shared.models.model_cards import ModelTask, card_cache
+from exo.shared.models.model_cards import ConfigData, ModelTask, card_cache
 from exo.shared.types.backends import Backend
 from exo.shared.types.common import ModelId
+
+
+def test_qwen4_exp_config_supports_tensor() -> None:
+    config = ConfigData.model_validate(
+        {
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "hidden_size": 4096,
+            "num_hidden_layers": 48,
+        }
+    )
+
+    assert config.supports_tensor
+
+
+def test_glm5_next_text_config_supports_tensor() -> None:
+    config = ConfigData.model_validate(
+        {
+            "architectures": ["Glm5NextForConditionalGeneration"],
+            "model_type": "glm5_next",
+            "text_config": {
+                "model_type": "glm5_next_text",
+                "hidden_size": 4096,
+                "num_hidden_layers": 45,
+                "max_position_embeddings": 1048576,
+            },
+        }
+    )
+
+    assert config.supports_tensor
+    assert config.layer_count == 45
+    assert config.hidden_size == 4096
+    assert config.vision is None
 
 
 @pytest.mark.parametrize(

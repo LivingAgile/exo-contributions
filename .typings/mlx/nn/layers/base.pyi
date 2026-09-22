@@ -245,7 +245,7 @@ class Module(dict):
             The module instance after updating the parameters.
         """
 
-    def update_modules(self, modules: dict, strict: bool = ...) -> Module:
+    def update_modules(self, modules: dict[str, Any], strict: bool = ...) -> Module:
         """Replace the child modules of this :class:`Module` instance with the
         provided ones in the dict of dicts and lists.
 

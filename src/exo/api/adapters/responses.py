@@ -347,8 +347,8 @@ async def responses_request_to_text_generation(
         built_chat_template = chat_template_messages if chat_template_messages else None
 
     effort_from_reasoning = request.reasoning.effort if request.reasoning else None
-    resolved_effort, resolved_thinking = resolve_reasoning_params(
-        effort_from_reasoning, request.enable_thinking
+    resolved_effort, resolved_thinking = await resolve_reasoning_params(
+        effort_from_reasoning, request.enable_thinking, request.model
     )
 
     # The responses API often does not provide tool args nested under a "function" field.

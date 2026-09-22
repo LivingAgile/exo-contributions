@@ -1,3 +1,4 @@
+import re
 from collections.abc import Callable, Generator, Iterator
 from functools import cache
 from typing import Any
@@ -5,6 +6,7 @@ from typing import Any
 from mlx_lm.models.deepseek_v4 import Model as DeepseekV4Model
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
 from mlx_lm.models.gpt_oss import Model as GptOssModel
+from mlx_lm.models.muse_glimmer import Model as MuseGlimmerModel
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from openai_harmony import (  # pyright: ignore[reportMissingTypeStubs]
     HarmonyEncodingName,
@@ -29,7 +31,10 @@ from exo.worker.engines.mlx.utils_mlx import (
 )
 from exo.worker.engines.mlx.vendor.dsml_encoding import parse_dsml_output
 from exo.worker.runner.bootstrap import logger
-from exo.worker.runner.llm_inference.tool_parsers import ToolParser
+from exo.worker.runner.llm_inference.tool_parsers import (
+    ToolParser,
+    parse_atem_tool_calls,
+)
 
 
 @cache
@@ -76,7 +81,9 @@ def apply_all_parsers(
     generator = receiver
 
     normalized_id = model_id.normalize().lower()
-    if issubclass(model_type, GptOssModel):
+    if issubclass(model_type, MuseGlimmerModel):
+        generator = parse_atem_output(generator, tools)
+    elif issubclass(model_type, GptOssModel):
         generator = parse_gpt_oss(generator)
     elif issubclass(model_type, DeepseekV32Model) and "deepseek" in normalized_id:
         if tokenizer.has_thinking:
@@ -111,6 +118,155 @@ def apply_all_parsers(
     generator = count_reasoning_tokens(generator)
 
     return map(lambda r: map_responses_to_chunks(r, model_id), generator)
+
+
+_ATEM_CHANNEL_PATTERN = re.compile(
+    r"to=([A-Za-z0-9_.\-*]+)<\|message\|>(.*?)<\|(eom|eot)\|>",
+    re.DOTALL,
+)
+_MUSE_EOT_TOKEN_ID = 200008
+
+
+def parse_atem_output(
+    responses: Generator[GenerationResponse | None],
+    tools: list[dict[str, Any]] | None,
+) -> Generator[GenerationResponse | ToolCallResponse | None]:
+    pending: list[GenerationResponse] = []
+    protocol_mode = False
+    last_response: GenerationResponse | None = None
+
+    for response in responses:
+        if response is None:
+            yield None
+            continue
+        last_response = response
+
+        if protocol_mode:
+            pending.append(response)
+            if response.finish_reason is not None:
+                yield from _parse_complete_atem(pending, tools)
+                return
+            continue
+
+        candidate = response.text.lstrip(" ")
+        if not pending and not (
+            candidate == ""
+            or candidate.startswith("to=")
+            or "to=".startswith(candidate)
+        ):
+            yield response
+            continue
+
+        pending.append(response)
+        combined = "".join(item.text for item in pending)
+        candidate = combined.lstrip(" ")
+        if candidate.startswith("to="):
+            protocol_mode = True
+            if response.finish_reason is not None:
+                yield from _parse_complete_atem(pending, tools)
+                return
+            continue
+        if candidate == "" and response.finish_reason is None:
+            continue
+        if candidate and "to=".startswith(candidate):
+            if response.finish_reason is not None:
+                yield _atem_error(response)
+                return
+            continue
+
+        yield from pending
+        pending.clear()
+
+    if protocol_mode and last_response is not None:
+        yield _atem_error(last_response)
+    else:
+        yield from pending
+
+
+def _parse_complete_atem(
+    responses: list[GenerationResponse],
+    tools: list[dict[str, Any]] | None,
+) -> Generator[GenerationResponse | ToolCallResponse, None, None]:
+    terminal = responses[-1]
+    if terminal.finish_reason != "stop":
+        yield _atem_error(terminal)
+        return
+
+    text = "".join(item.text for item in responses).lstrip(" ")
+    text = text.replace(
+        "<|eom|><|start|>assistant to=",
+        "<|eom|>to=",
+    )
+    if terminal.token == _MUSE_EOT_TOKEN_ID and not text.endswith("<|eot|>"):
+        text += "<|eot|>"
+    position = 0
+    reasoning: list[str] = []
+    terminal_result: GenerationResponse | ToolCallResponse | None = None
+
+    for channel in _ATEM_CHANNEL_PATTERN.finditer(text):
+        if channel.start() != position:
+            yield _atem_error(terminal)
+            return
+        position = channel.end()
+        recipient, body, ending = channel.groups()
+        if terminal_result is not None:
+            yield _atem_error(terminal)
+            return
+
+        if recipient == "self":
+            if ending != "eom":
+                yield _atem_error(terminal)
+                return
+            reasoning.append(body)
+            continue
+
+        if ending != "eot":
+            yield _atem_error(terminal)
+            return
+        if recipient == "user":
+            terminal_result = terminal.model_copy(
+                update={"text": body, "is_thinking": False}
+            )
+            continue
+
+        calls = parse_atem_tool_calls(body, recipient, tools)
+        if calls is None:
+            yield _atem_error(terminal)
+            return
+        terminal_result = ToolCallResponse(
+            tool_calls=calls,
+            usage=terminal.usage,
+            stats=terminal.stats,
+        )
+
+    if position != len(text) or terminal_result is None:
+        yield _atem_error(terminal)
+        return
+
+    for body in reasoning:
+        if body:
+            yield terminal.model_copy(
+                update={
+                    "text": body,
+                    "token": 0,
+                    "finish_reason": None,
+                    "usage": None,
+                    "stats": None,
+                    "is_thinking": True,
+                }
+            )
+    yield terminal_result
+
+
+def _atem_error(response: GenerationResponse) -> GenerationResponse:
+    return response.model_copy(
+        update={
+            "text": "Malformed Muse ATEM output",
+            "token": 0,
+            "finish_reason": "error",
+            "is_thinking": False,
+        }
+    )
 
 
 def map_responses_to_chunks(
@@ -386,8 +542,17 @@ def parse_thinking_models(
         accumulated += response.text
 
         if response.finish_reason is not None:
+            if (accumulated == think_start and not is_thinking) or (
+                accumulated == think_end and is_thinking
+            ):
+                is_thinking = not is_thinking
+                pending_buffer.clear()
+                yield response.model_copy(
+                    update={"text": "", "is_thinking": is_thinking}
+                )
+                continue
             yield from drain_pending(is_thinking)
-            yield response.model_copy(update={"is_thinking": False})
+            yield response.model_copy(update={"is_thinking": is_thinking})
             continue
 
         if accumulated == think_start and not is_thinking:

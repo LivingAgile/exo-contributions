@@ -29,7 +29,7 @@ from exo.shared.constants import (
 from exo.shared.types.backends import Backend
 from exo.shared.types.common import ModelId
 from exo.shared.types.memory import Memory
-from exo.shared.types.text_generation import ReasoningDialect
+from exo.shared.types.text_generation import ReasoningDialect, ReasoningEffort
 from exo.utils.pydantic_ext import FrozenModel
 
 # kinda ugly...
@@ -178,6 +178,7 @@ class ModelCard(FrozenModel):
     capabilities: list[str] = []
     backends: list[Backend]
     reasoning_dialect: ReasoningDialect = "none"
+    default_reasoning_effort: ReasoningEffort | None = None
     context_length: int = 0
     uses_cfg: bool = False
     trust_remote_code: bool = True
@@ -295,6 +296,7 @@ class ConfigData(BaseModel):
         return self.architectures in [
             ["Glm4MoeLiteForCausalLM"],
             ["GlmMoeDsaForCausalLM"],
+            ["Glm5NextForConditionalGeneration"],
             ["DeepseekV4ForCausalLM"],
             ["DeepseekV32ForCausalLM"],
             ["DeepseekV3ForCausalLM"],
@@ -303,12 +305,14 @@ class ConfigData(BaseModel):
             ["Qwen3_5MoeForConditionalGeneration"],
             ["Qwen3_5ForConditionalGeneration"],
             ["Qwen3VLForConditionalGeneration"],
+            ["Qwen4ExpForConditionalGeneration"],
             ["MiniMaxM2ForCausalLM"],
             ["LlamaForCausalLM"],
             ["GptOssForCausalLM"],
             ["Step3p5ForCausalLM"],
             ["NemotronHForCausalLM"],
             ["Gemma4ForConditionalGeneration"],
+            ["MuseGlimmerForConditionalGeneration"],
         ]
 
     @model_validator(mode="before")

@@ -211,7 +211,41 @@ class TestThinkingModelsFinishReason:
             if isinstance(r, GenerationResponse) and r.finish_reason is not None
         ]
         assert len(last_gen) == 1
-        assert last_gen[0].is_thinking is False
+        assert last_gen[0].is_thinking is True
+
+    def test_terminal_reasoning_stays_in_reasoning_channel(self):
+        for finish_reason in ("length", "stop"):
+            tokens = [_make_response(" 9", 0, finish_reason=finish_reason)]
+            results = _step_until_finish(
+                parse_thinking_models(
+                    _queue_source(tokens),
+                    "<think>",
+                    "</think>",
+                    starts_in_thinking=True,
+                )
+            )
+            terminal = [
+                item for item in results if isinstance(item, GenerationResponse)
+            ]
+            assert len(terminal) == 1
+            assert terminal[0].text == " 9"
+            assert terminal[0].is_thinking is True
+            assert terminal[0].finish_reason == finish_reason
+
+    def test_terminal_closing_tag_is_not_visible_text(self):
+        tokens = [_make_response("</think>", 0, finish_reason="length")]
+        results = _step_until_finish(
+            parse_thinking_models(
+                _queue_source(tokens),
+                "<think>",
+                "</think>",
+                starts_in_thinking=True,
+            )
+        )
+        terminal = [item for item in results if isinstance(item, GenerationResponse)]
+        assert len(terminal) == 1
+        assert terminal[0].text == ""
+        assert terminal[0].finish_reason == "length"
 
     def test_finish_reason_after_thinking(self):
         tokens = [

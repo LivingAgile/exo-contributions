@@ -11,18 +11,26 @@ from exo_rs import (
 
 
 @pytest.mark.asyncio
-async def test_sleep_on_multiple_items() -> None:
+async def test_sleep_on_multiple_items(
+    unused_tcp_port: int, unused_udp_port: int
+) -> None:
     print("PYTHON: starting handle")
-    h = NetworkingHandle.new(os.urandom(16).hex().lstrip("0"), 52414, 52413)
+    identity = os.urandom(16).hex().lstrip("0") or "1"
+    handle = NetworkingHandle.new(
+        identity, f"exo-binding-test-{identity}", unused_tcp_port, unused_udp_port
+    )
     print("PYTHON: handle started")
 
-    rt = asyncio.create_task(_await_recv(h))
-
-    # sleep for 4 ticks
-    for i in range(10):
-        await asyncio.sleep(1)
-
-        await h.gossipsub_publish("topic", b"somehting or other")
+    receiver = asyncio.create_task(_await_recv(handle))
+    try:
+        async with asyncio.timeout(30):
+            for tick in range(10):
+                await asyncio.sleep(1)
+                await handle.gossipsub_publish("topic", f"tick-{tick}".encode())
+                assert not receiver.done()
+    finally:
+        receiver.cancel()
+        await asyncio.gather(receiver, return_exceptions=True)
 
 
 def test_pidfile(capsys: CaptureFixture[str]):

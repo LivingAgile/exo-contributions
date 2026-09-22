@@ -1,7 +1,8 @@
 import gc
 import os
+from collections.abc import MutableSequence
 from copy import deepcopy
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import mlx.core as mx
 import numpy as np
@@ -20,6 +21,8 @@ from mlx_lm.models.deepseek_v4 import (
     _CompressorBranch as CompressorBranch,  # type: ignore
 )
 from mlx_lm.tokenizer_utils import TokenizerWrapper
+from mlx_vlm.models.cache import ArraysCache as VlmArraysCache
+from mlx_vlm.models.cache import CacheList as VlmCacheList
 
 from exo.shared.types.memory import Memory
 from exo.worker.engines.mlx.constants import CACHE_GROUP_SIZE, KV_CACHE_BITS
@@ -54,7 +57,13 @@ class CacheSnapshot:
     def __init__(
         self,
         states: list[
-            RotatingKVCache | ArraysCache | CacheList | DeepseekV4Cache | None
+            RotatingKVCache
+            | ArraysCache
+            | CacheList
+            | DeepseekV4Cache
+            | VlmArraysCache
+            | VlmCacheList
+            | None
         ],
         token_count: int,
     ):
@@ -165,9 +174,25 @@ def _copy_v4_cache(c: DeepseekV4Cache) -> DeepseekV4Cache:
 
 
 def copy_snapshot_entry(
-    entry: ArraysCache | RotatingKVCache | CacheList | DeepseekV4Cache | None,
-) -> ArraysCache | RotatingKVCache | CacheList | DeepseekV4Cache | None:
+    entry: ArraysCache
+    | RotatingKVCache
+    | CacheList
+    | DeepseekV4Cache
+    | VlmArraysCache
+    | VlmCacheList
+    | None,
+) -> (
+    ArraysCache
+    | RotatingKVCache
+    | CacheList
+    | DeepseekV4Cache
+    | VlmArraysCache
+    | VlmCacheList
+    | None
+):
     match entry:
+        case VlmArraysCache() | VlmCacheList():
+            return deepcopy(entry)
         case None:
             return None
         case RotatingKVCache():
@@ -183,10 +208,18 @@ def copy_snapshot_entry(
 
 def snapshot_ssm_states(cache: KVCacheType) -> CacheSnapshot:
     states: list[
-        RotatingKVCache | ArraysCache | CacheList | DeepseekV4Cache | None
+        RotatingKVCache
+        | ArraysCache
+        | CacheList
+        | DeepseekV4Cache
+        | VlmArraysCache
+        | VlmCacheList
+        | None
     ] = []
     for c in cache:
-        if isinstance(c, ArraysCache):
+        if isinstance(c, (VlmArraysCache, VlmCacheList)):
+            states.append(deepcopy(c))
+        elif isinstance(c, ArraysCache):
             states.append(_copy_arrays_cache(c))
         elif isinstance(c, RotatingKVCache):
             states.append(copy_rotating_kv_cache(c))
@@ -217,7 +250,7 @@ def is_non_trimmable_cache_entry(c: object) -> bool:
     """A cache entry is non-trimmable if `trim(n)` can't roll back its full
     state — meaning the prefill +2 rollback must snapshot+restore it instead.
     """
-    if isinstance(c, (ArraysCache, RotatingKVCache)):
+    if isinstance(c, (ArraysCache, RotatingKVCache, VlmArraysCache, VlmCacheList)):
         return True
     if isinstance(c, CacheList):
         return not bool(c.is_trimmable())  # type: ignore[reportUnknownMemberType]
@@ -382,6 +415,8 @@ class KVPrefixCache:
             trim_cache(prompt_cache, tokens_to_trim, restore_snap)
             # Reset cache offset to match trimmed length
             for c in prompt_cache:
+                if isinstance(c, (VlmArraysCache, VlmCacheList)):
+                    continue
                 if isinstance(c, (ArraysCache, RotatingKVCache)):
                     continue
                 if isinstance(c, DeepseekV4Cache):
@@ -476,6 +511,11 @@ def trim_cache(
     snapshot: CacheSnapshot | None = None,
 ) -> None:
     for i, c in enumerate(cache):
+        if isinstance(c, (VlmArraysCache, VlmCacheList)):
+            if snapshot is None or snapshot.states[i] is None:
+                raise ValueError("MLX-VLM cache rollback requires a snapshot")
+            cast(MutableSequence[object], cache)[i] = deepcopy(snapshot.states[i])
+            continue
         non_trimmable = isinstance(c, (ArraysCache, RotatingKVCache)) or (
             isinstance(c, CacheList) and not bool(c.is_trimmable())  # type: ignore[reportUnknownMemberType]
         )
@@ -519,9 +559,13 @@ def _entry_length(
     | QuantizedKVCache
     | ArraysCache
     | CacheList
-    | DeepseekV4Cache,
+    | DeepseekV4Cache
+    | VlmArraysCache
+    | VlmCacheList,
 ) -> int:
     # Use .offset attribute which KVCache types have (len() not implemented in older QuantizedKVCache).
+    if isinstance(c, (VlmArraysCache, VlmCacheList)):
+        return c.size()
     if hasattr(c, "offset"):
         return c.offset
     # For CacheList

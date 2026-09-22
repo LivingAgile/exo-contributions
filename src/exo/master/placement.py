@@ -136,16 +136,28 @@ def place_instance(
                 f"Requested Tensor sharding but this model does not support tensor parallelism: {command.model_card.model_id}"
             )
         # TODO: the condition here for tensor parallel is not correct, but it works good enough for now.
-        # DeepSeek V4 is MQA (num_key_value_heads=1) but its sharding strategy
-        # head-parallelises wq_b/wo_a and shards MoE experts instead of splitting
-        # KV heads, so the kv-head divisibility check doesn't apply.
+        # DeepSeek V4 head-parallelises wq_b/wo_a, while Qwen4Exp replicates
+        # attention and shards only MoE projections. Neither splits KV heads.
         is_deepseek_v4 = command.model_card.base_model.startswith("DeepSeek V4")
+        is_qwen4_exp = (
+            command.model_card.vision is not None
+            and command.model_card.vision.model_type == "qwen4_exp"
+        )
+        is_muse_glimmer = (
+            command.model_card.vision is not None
+            and command.model_card.vision.model_type == "muse_glimmer"
+        )
+        uses_replicated_kv_heads = is_deepseek_v4 or is_qwen4_exp or is_muse_glimmer
         kv_heads = command.model_card.num_key_value_heads
         cycles_with_sufficient_memory = [
             cycle
             for cycle in cycles_with_sufficient_memory
             if command.model_card.hidden_size % len(cycle) == 0
-            and (is_deepseek_v4 or kv_heads is None or kv_heads % len(cycle) == 0)
+            and (
+                uses_replicated_kv_heads
+                or kv_heads is None
+                or kv_heads % len(cycle) == 0
+            )
         ]
         if not cycles_with_sufficient_memory:
             raise ValueError(

@@ -7,12 +7,12 @@ generation step evaluates every cache's arrays and explicitly includes recurrent
 length/padding metadata omitted by the pinned MLX-LM cache interface. Both
 top-logprob modes use the existing asynchronous boundary. This correction is
 EXO-owned, applies to both Nix and uv source builds, and requires no MLX-LM patch.
-This integration branch pins `LivingAgile/mlx-lm` at
-`7c4a3669d87d0cc9bdc63433030932850221f40e` in the manifest and `uv.lock`.
-It preserves the previous fork's features and adds native batch-cache evaluation
-and continued-prefill masking corrections. The separately qualified EXO-only
-contribution retains its original dependency; its four-node qualification does
-not certify this integrated identity. Integrated four-node qualification is pending.
+This candidate branch pins `LivingAgile/mlx-lm` at
+`554759fc83c0c777a2b5d2396f58c73502f642d8` in the manifest and `uv.lock`.
+It preserves the previous fork's features, adds native batch-cache evaluation and
+continued-prefill masking corrections, and supplies native Qwen4Exp model support.
+The earlier four-node Qwen3.8 qualification does not certify this candidate identity;
+candidate four-node qualification is pending.
 
 Related upstream work includes [MLX-LM #1632](https://github.com/ml-explore/mlx-lm/pull/1632)
 and [#1845](https://github.com/ml-explore/mlx-lm/issues/1845). The separate native
