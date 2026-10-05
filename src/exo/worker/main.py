@@ -291,6 +291,8 @@ class Worker:
                         )
                     finally:
                         runner.shutdown()
+                        with anyio.CancelScope(shield=True):
+                            await runner.runner_process.stop()
                 case CancelTask(
                     cancelled_task_id=cancelled_task_id, runner_id=runner_id
                 ):
