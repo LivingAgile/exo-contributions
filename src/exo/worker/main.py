@@ -281,10 +281,12 @@ class Worker:
                         )
                 case Shutdown(runner_id=runner_id):
                     runner = self.runners.pop(runner_id)
+                    shutdown_timed_out = False
                     try:
                         with fail_after(3):
                             await runner.start_task(task)
                     except TimeoutError:
+                        shutdown_timed_out = True
                         await self.event_sender.send(
                             TaskStatusUpdated(
                                 task_id=task.task_id, task_status=TaskStatus.TimedOut
@@ -294,6 +296,16 @@ class Worker:
                         runner.shutdown()
                         with anyio.CancelScope(shield=True):
                             await runner.runner_process.stop()
+                        if (
+                            not shutdown_timed_out
+                            and task.task_id not in runner.completed
+                        ):
+                            await self.event_sender.send(
+                                TaskStatusUpdated(
+                                    task_id=task.task_id,
+                                    task_status=TaskStatus.Complete,
+                                )
+                            )
                         if not isinstance(runner.status, RunnerFailed):
                             await self.event_sender.send(
                                 RunnerStatusUpdated(

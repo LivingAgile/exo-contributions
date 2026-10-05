@@ -403,6 +403,8 @@ async def test_workers_wait_for_all_old_processes_before_replacement(
     peer_shutting_down = False
     failed_worker_started = False
     replacement_planned = False
+    failed_shutdown_task_id: TaskId | None = None
+    shutdown_statuses: dict[TaskId, TaskStatus] = {}
     event_index = 0
 
     async def observe_peer_exit_ready() -> None:
@@ -495,6 +497,14 @@ async def test_workers_wait_for_all_old_processes_before_replacement(
                     task_group.start_soon(workers[1].run)
                     while True:
                         event = await event_receiver.receive()
+                        if (
+                            isinstance(event, TaskCreated)
+                            and isinstance(event.task, Shutdown)
+                            and event.task.runner_id == runner_id
+                        ):
+                            failed_shutdown_task_id = event.task.task_id
+                        if isinstance(event, TaskStatusUpdated):
+                            shutdown_statuses[event.task_id] = event.task_status
                         if isinstance(event, RunnerStatusUpdated):
                             if event.runner_id == peer_runner_id:
                                 if isinstance(event.runner_status, RunnerShuttingDown):
@@ -516,6 +526,13 @@ async def test_workers_wait_for_all_old_processes_before_replacement(
                                     runner_id
                                 ].runner_process.pid != (
                                     old_supervisors[0].runner_process.pid
+                                )
+                                assert failed_shutdown_task_id is not None
+                                assert (
+                                    shutdown_statuses.get(failed_shutdown_task_id)
+                                    == TaskStatus.Complete
+                                ), (
+                                    "Failed-runner Shutdown remained nonterminal before replacement"
                                 )
                                 break
                         if isinstance(event, TaskCreated) and isinstance(
