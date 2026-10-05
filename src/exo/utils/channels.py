@@ -312,9 +312,10 @@ class MpReceiver[T]:
     """
 
     _state: MpState[T] = field()
+    _closed: bool = field(default=False, init=False)
 
     def receive_nowait(self) -> T:
-        if self._state.closed.is_set():
+        if self._closed:
             raise ClosedResourceError
 
         try:
@@ -351,6 +352,7 @@ class MpReceiver[T]:
         )
 
     def close(self) -> None:
+        self._closed = True
         if not self._state.closed.is_set():
             self._state.closed.set()
         with contextlib.suppress(Exception):
@@ -404,7 +406,7 @@ class MpReceiver[T]:
             try:
                 item = self.receive_nowait()
                 out.append(item)
-            except WouldBlock:
+            except (WouldBlock, EndOfStream):
                 break
         return out
 

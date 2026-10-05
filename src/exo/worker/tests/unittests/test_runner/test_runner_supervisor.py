@@ -3,20 +3,35 @@ from typing import cast
 import anyio
 import pytest
 
+from exo.shared.logging import logger_cleanup, logger_setup
 from exo.shared.models.model_cards import ModelId
 from exo.shared.types.chunks import ErrorChunk
+from exo.shared.types.commands import ForwarderCommand, ForwarderDownloadCommand
 from exo.shared.types.common import CommandId, NodeId
-from exo.shared.types.events import ChunkGenerated, Event, RunnerStatusUpdated
-from exo.shared.types.tasks import Task, TaskId, TextGeneration
+from exo.shared.types.events import (
+    ChunkGenerated,
+    Event,
+    IndexedEvent,
+    RunnerStatusUpdated,
+    TaskCreated,
+    TaskStatusUpdated,
+)
+from exo.shared.types.tasks import Shutdown, Task, TaskId, TaskStatus, TextGeneration
 from exo.shared.types.text_generation import (
     InputMessage,
     InputMessageContent,
     TextGenerationTaskParams,
 )
 from exo.shared.types.worker.instances import BoundInstance, InstanceId
-from exo.shared.types.worker.runners import RunnerFailed, RunnerId
+from exo.shared.types.worker.runners import (
+    RunnerFailed,
+    RunnerId,
+    RunnerShutdown,
+    RunnerShuttingDown,
+)
 from exo.utils.async_process import AsyncProcess
 from exo.utils.channels import channel, mp_channel
+from exo.worker.main import Worker
 from exo.worker.runner.bootstrap import RunnerTerminationError
 from exo.worker.runner.supervisor import RunnerStdioHandler, RunnerSupervisor
 from exo.worker.tests.unittests.conftest import get_bound_mlx_ring_instance
@@ -95,3 +110,91 @@ async def test_check_runner_emits_error_chunk_for_inflight_text_generation() -> 
     event_sender.close()
     with anyio.move_on_after(0.1):
         await event_receiver.aclose()
+
+
+@pytest.mark.anyio
+async def test_worker_shutdown_forwards_terminal_task_and_runner(
+    request: pytest.FixtureRequest,
+) -> None:
+    logger_setup(None)
+    request.addfinalizer(logger_cleanup)
+    event_sender, event_receiver = channel[Event](max_buffer_size=0)
+    indexed_sender, indexed_receiver = channel[IndexedEvent]()
+    command_sender, command_receiver = channel[ForwarderCommand]()
+    download_sender, download_receiver = channel[ForwarderDownloadCommand]()
+    node_id = NodeId("shutdown-node")
+    runner_id = RunnerId("shutdown-runner")
+    bound_instance = get_bound_mlx_ring_instance(
+        instance_id=InstanceId("removed-instance"),
+        model_id=ModelId("mlx-community/Llama-3.2-1B-Instruct-4bit"),
+        runner_id=runner_id,
+        node_id=node_id,
+    )
+    worker = Worker(
+        node_id,
+        event_receiver=indexed_receiver,
+        event_sender=event_sender,
+        command_sender=command_sender,
+        download_command_sender=download_sender,
+        api_port=0,
+    )
+    supervisor = await RunnerSupervisor.create(
+        bound_instance=bound_instance, event_sender=event_sender.clone()
+    )
+    worker.runners[runner_id] = supervisor
+    shutdown_task: Shutdown | None = None
+    observed: list[Event] = []
+
+    with (
+        event_sender,
+        event_receiver,
+        indexed_sender,
+        indexed_receiver,
+        command_sender,
+        command_receiver,
+        download_sender,
+        download_receiver,
+        anyio.fail_after(20),
+    ):
+        async with anyio.create_task_group() as task_group:
+            try:
+                task_group.start_soon(supervisor.run)
+                observed.append(await event_receiver.receive())
+                task_group.start_soon(worker.plan_step)
+                while True:
+                    event = await event_receiver.receive()
+                    observed.append(event)
+                    if isinstance(event, TaskCreated) and isinstance(
+                        event.task, Shutdown
+                    ):
+                        shutdown_task = event.task
+                    if isinstance(event, RunnerStatusUpdated) and isinstance(
+                        event.runner_status, RunnerShuttingDown
+                    ):
+                        break
+
+                await anyio.sleep(0.1)
+                with anyio.move_on_after(1):
+                    while True:
+                        event = await event_receiver.receive()
+                        observed.append(event)
+                        if isinstance(event, RunnerStatusUpdated) and isinstance(
+                            event.runner_status, RunnerShutdown
+                        ):
+                            break
+            finally:
+                task_group.cancel_scope.cancel()
+
+    assert shutdown_task is not None
+    assert any(
+        isinstance(event, TaskStatusUpdated)
+        and event.task_id == shutdown_task.task_id
+        and event.task_status == TaskStatus.Complete
+        for event in observed
+    ), observed
+    assert any(
+        isinstance(event, RunnerStatusUpdated)
+        and event.runner_id == runner_id
+        and isinstance(event.runner_status, RunnerShutdown)
+        for event in observed
+    ), observed

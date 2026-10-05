@@ -27,6 +27,7 @@ from exo.shared.types.tasks import (
     CANCEL_ALL_TASKS,
     ImageEdits,
     ImageGeneration,
+    Shutdown,
     Task,
     TaskId,
     TaskStatus,
@@ -39,6 +40,7 @@ from exo.shared.types.worker.runners import (
     RunnerIdle,
     RunnerLoading,
     RunnerRunning,
+    RunnerShutdown,
     RunnerShuttingDown,
     RunnerStatus,
     RunnerWarmingUp,
@@ -327,7 +329,10 @@ class RunnerSupervisor:
                     if isinstance(event, RunnerStatusUpdated):
                         self.status = event.runner_status
                     if isinstance(event, TaskAcknowledged):
-                        self.pending.pop(event.task_id).set()
+                        if not isinstance(
+                            self.in_progress.get(event.task_id), Shutdown
+                        ):
+                            self.pending.pop(event.task_id).set()
                         continue
                     if (
                         isinstance(event, TaskStatusUpdated)
@@ -347,6 +352,11 @@ class RunnerSupervisor:
                         self.in_progress.pop(event.task_id, None)
                         self.completed.add(event.task_id)
                     await self._event_sender.send(event)
+                    if isinstance(event, RunnerStatusUpdated) and isinstance(
+                        event.runner_status, RunnerShutdown
+                    ):
+                        for task_id in self.pending.keys() & self.completed:
+                            self.pending.pop(task_id).set()
         except (ClosedResourceError, BrokenResourceError):
             # this is the happy path shutdown - we don't need to spam log with it
             await self._check_runner()
