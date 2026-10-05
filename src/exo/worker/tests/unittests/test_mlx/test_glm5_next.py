@@ -1,5 +1,6 @@
 import copy
 import json
+import weakref
 from pathlib import Path
 from typing import Any, cast
 
@@ -22,13 +23,16 @@ from exo.shared.types.text_generation import TextGenerationTaskParams
 from exo.utils.channels import MpReceiver, MpSender, MpState
 from exo.worker.engines.mlx.builder import MlxBuilder
 from exo.worker.engines.mlx.cache import (
+    CacheSnapshot,
     KVPrefixCache,
     has_non_kv_caches,
     snapshot_ssm_states,
     trim_cache,
 )
+from exo.worker.engines.mlx.generator import generate as generation
 from exo.worker.engines.mlx.generator.generate import mlx_generate
 from exo.worker.engines.mlx.glm5_next import Model, ModelArgs
+from exo.worker.engines.mlx.types import KVCacheType
 from exo.worker.engines.mlx.types import Model as ExoModel
 from exo.worker.engines.mlx.utils_mlx import load_model_for_exo
 from exo.worker.runner.llm_inference.batch_generator import SequentialGenerator
@@ -153,6 +157,22 @@ def test_flash_production_generation_prefix_reuse(monkeypatch: pytest.MonkeyPatc
         )
         assert isinstance(builder.build(), SequentialGenerator)
     progress: list[int] = []
+    snapshot_references: list[weakref.ReferenceType[CacheSnapshot]] = []
+    original_snapshot = generation.snapshot_ssm_states
+
+    def observe_snapshot(cache: KVCacheType) -> CacheSnapshot:
+        snapshot = original_snapshot(cache)
+        snapshot_references.append(weakref.ref(snapshot))
+        return snapshot
+
+    def observe_progress(processed: int, total: int) -> None:
+        progress.append(processed)
+        live_snapshots = sum(
+            reference() is not None for reference in snapshot_references
+        )
+        assert 1 <= live_snapshots <= 2
+
+    monkeypatch.setattr(generation, "snapshot_ssm_states", observe_snapshot)
     list(
         mlx_generate(
             model=model,
@@ -161,10 +181,12 @@ def test_flash_production_generation_prefix_reuse(monkeypatch: pytest.MonkeyPatc
             prompt=" ".join(["one"] * 600),
             kv_prefix_cache=None,
             group=None,
-            on_prefill_progress=lambda processed, total: progress.append(processed),
+            on_prefill_progress=observe_progress,
         )
     )
     assert 512 in progress
+    assert len(snapshot_references) > 2
+    assert all(reference() is None for reference in snapshot_references)
     prefix = KVPrefixCache(None)
     for prompt in ("one two three", "one two three", "one two three four"):
         results = [

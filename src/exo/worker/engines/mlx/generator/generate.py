@@ -316,6 +316,8 @@ def prefill(
         )
         if has_ssm:
             snapshots.append(snapshot_ssm_states(cache))
+            if isinstance(model, FlashModel):
+                del snapshots[:-2]
 
         if on_prefill_progress is not None:
             on_prefill_progress(processed, total)
