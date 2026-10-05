@@ -1,4 +1,5 @@
 import hashlib
+import os
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -53,8 +54,20 @@ from exo.shared.types.text_generation import Base64Image, Base64ImageHash
 from exo.shared.types.topology import Connection, SocketConnection
 from exo.shared.types.worker.downloads import DownloadCompleted
 from exo.shared.types.worker.instances import InstanceId
-from exo.shared.types.worker.runners import RunnerFailed, RunnerId, RunnerShutdown
+from exo.shared.types.worker.runners import (
+    RunnerFailed,
+    RunnerId,
+    RunnerShutdown,
+    RunnerShuttingDown,
+)
 from exo.utils.channels import Receiver, Sender, channel
+from exo.utils.gpu_drain import (
+    GPU_DRAIN_LIMIT_BYTES,
+    GPU_DRAIN_LOW_SAMPLES,
+    GPU_DRAIN_POLL_SECONDS,
+    GPU_DRAIN_TIMEOUT_SECONDS,
+    MacOSAllocationReader,
+)
 from exo.utils.info_gatherer.info_gatherer import GatheredInfo, InfoGatherer
 from exo.utils.info_gatherer.net_profile import check_reachable
 from exo.utils.keyed_backoff import KeyedBackoff
@@ -85,6 +98,11 @@ class Worker:
 
         self.state: State = State()
         self.runners: dict[RunnerId, RunnerSupervisor] = {}
+        drain_setting = os.getenv("EXO_GPU_DRAIN_ENABLED", "0")
+        if drain_setting not in ("0", "1"):
+            raise ValueError("EXO_GPU_DRAIN_ENABLED must be 0 or 1")
+        self._gpu_drain_enabled = drain_setting == "1"
+        self._terminal_runners: set[RunnerId] = set()
         self._tg: TaskGroup = TaskGroup()
 
         self._system_id = SystemId()
@@ -145,6 +163,12 @@ class Worker:
                 self.state = apply(self.state, event=event)
                 event = event.event
 
+                if isinstance(event, RunnerStatusUpdated):
+                    if isinstance(event.runner_status, RunnerShutdown):
+                        self._terminal_runners.add(event.runner_id)
+                    else:
+                        self._terminal_runners.discard(event.runner_id)
+
                 if isinstance(event, InstanceDeleted):
                     self._instance_backoff.reset(event.instance_id)
 
@@ -178,6 +202,45 @@ class Worker:
                                 )
                             ] = img
 
+    async def _wait_for_gpu_drain(self, runner: RunnerSupervisor) -> bool:
+        reader: MacOSAllocationReader | None = None
+        try:
+            with fail_after(GPU_DRAIN_TIMEOUT_SECONDS):
+                instance = runner.bound_instance.instance
+                runner_id = runner.bound_instance.bound_runner_id
+                while instance.instance_id in self.state.instances and not all(
+                    isinstance(self.state.runners.get(peer), RunnerShuttingDown)
+                    or (
+                        peer not in self.state.runners
+                        and peer in self._terminal_runners
+                    )
+                    for peer in instance.shard_assignments.node_to_runner.values()
+                    if peer != runner_id
+                ):
+                    await anyio.sleep(GPU_DRAIN_POLL_SECONDS)
+                reader = MacOSAllocationReader()
+                low_samples = 0
+                allocation = reader.allocation()
+                while low_samples < GPU_DRAIN_LOW_SAMPLES:
+                    low_samples = (
+                        low_samples + 1 if allocation < GPU_DRAIN_LIMIT_BYTES else 0
+                    )
+                    if low_samples < GPU_DRAIN_LOW_SAMPLES:
+                        await anyio.sleep(GPU_DRAIN_POLL_SECONDS)
+                        allocation = reader.allocation()
+                logger.info(
+                    "Runner {} post-stop allocation observation passed: {} bytes",
+                    runner_id,
+                    allocation,
+                )
+                return True
+        except (TimeoutError, RuntimeError, OSError) as error:
+            logger.warning("GPU drain refused replacement: {}", error)
+            return False
+        finally:
+            if reader is not None:
+                reader.close()
+
     async def _reconcile_custom_cards(self) -> None:
         while True:
             await anyio.sleep(1)
@@ -205,6 +268,7 @@ class Worker:
                 self.image_cache,
                 self._instance_backoff,
                 self._download_backoff,
+                gpu_drain_enabled=self._gpu_drain_enabled,
             )
             if task is None:
                 continue
@@ -230,6 +294,7 @@ class Worker:
             # lets not kill the worker if a runner is unresponsive
             match task:
                 case CreateRunner():
+                    self._terminal_runners.discard(task.bound_instance.bound_runner_id)
                     await self._create_supervisor(task)
                     self._instance_backoff.record_attempt(task.instance_id)
                     await self.event_sender.send(
@@ -306,7 +371,19 @@ class Worker:
                                     task_status=TaskStatus.Complete,
                                 )
                             )
-                        if not isinstance(runner.status, RunnerFailed):
+                        drained = False
+                        if self._gpu_drain_enabled:
+                            await self.event_sender.send(
+                                RunnerStatusUpdated(
+                                    runner_id=runner_id,
+                                    runner_status=RunnerShuttingDown(),
+                                )
+                            )
+                            drained = await self._wait_for_gpu_drain(runner)
+                        if drained or (
+                            not self._gpu_drain_enabled
+                            and not isinstance(runner.status, RunnerFailed)
+                        ):
                             await self.event_sender.send(
                                 RunnerStatusUpdated(
                                     runner_id=runner_id,

@@ -57,12 +57,21 @@ def plan(
     image_cache: Mapping[Base64ImageHash, Base64Image],
     instance_backoff: KeyedBackoff[InstanceId],
     download_backoff: KeyedBackoff[ModelId],
+    *,
+    gpu_drain_enabled: bool = False,
 ) -> Task | None:
     # Python short circuiting OR logic should evaluate these sequentially.
     return (
         _cancel_tasks(runners, tasks)
-        or _kill_runner(runners, all_runners, instances)
-        or _create_runner(node_id, runners, all_runners, instances, instance_backoff)
+        or _kill_runner(runners, all_runners, instances, gpu_drain_enabled)
+        or _create_runner(
+            node_id,
+            runners,
+            all_runners,
+            instances,
+            instance_backoff,
+            gpu_drain_enabled,
+        )
         or _model_needs_download(
             node_id, runners, global_download_status, download_backoff
         )
@@ -77,6 +86,7 @@ def _kill_runner(
     runners: Mapping[RunnerId, RunnerSupervisor],
     all_runners: Mapping[RunnerId, RunnerStatus],
     instances: Mapping[InstanceId, Instance],
+    gpu_drain_enabled: bool = False,
 ) -> Shutdown | None:
     for runner in runners.values():
         runner_id = runner.bound_instance.bound_runner_id
@@ -94,7 +104,10 @@ def _kill_runner(
             if runner_id == global_runner_id:
                 continue
 
-            if isinstance(all_runners.get(global_runner_id, None), RunnerFailed):
+            peer_status = all_runners.get(global_runner_id)
+            if isinstance(peer_status, RunnerFailed) or (
+                gpu_drain_enabled and isinstance(peer_status, RunnerShuttingDown)
+            ):
                 return Shutdown(
                     instance_id=instance_id,
                     runner_id=runner_id,
@@ -107,6 +120,7 @@ def _create_runner(
     all_runners: Mapping[RunnerId, RunnerStatus],
     instances: Mapping[InstanceId, Instance],
     instance_backoff: KeyedBackoff[InstanceId],
+    gpu_drain_enabled: bool = False,
 ) -> CreateRunner | None:
     for instance in instances.values():
         runner_id = instance.shard_assignments.node_to_runner.get(node_id, None)
@@ -114,6 +128,12 @@ def _create_runner(
             continue
 
         if runner_id in runners:
+            continue
+
+        if gpu_drain_enabled and any(
+            isinstance(all_runners.get(assigned), (RunnerFailed, RunnerShuttingDown))
+            for assigned in instance.shard_assignments.node_to_runner.values()
+        ):
             continue
 
         # don't create runners if any other nodes have runners that have failed - wait for them to fix themselves first.

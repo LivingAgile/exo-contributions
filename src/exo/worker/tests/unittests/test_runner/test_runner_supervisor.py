@@ -1,7 +1,10 @@
 import contextlib
+import ctypes
+import gc
 import multiprocessing as mp
 import os
 import signal
+import sys
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack
 from multiprocessing.process import BaseProcess
@@ -19,6 +22,7 @@ from exo.shared.types.events import (
     ChunkGenerated,
     Event,
     IndexedEvent,
+    InstanceDeleted,
     RunnerStatusUpdated,
     TaskCreated,
     TaskStatusUpdated,
@@ -342,11 +346,86 @@ async def test_worker_waits_for_old_process_before_planning_replacement(
 @pytest.mark.skipif(
     not hasattr(signal, "SIGTERM"), reason="requires native child termination"
 )
+@pytest.mark.parametrize(
+    ("drain_enabled", "peer_failed", "allocation_unreadable", "removed_instance"),
+    [
+        (False, False, False, False),
+        pytest.param(
+            True,
+            False,
+            False,
+            False,
+            marks=pytest.mark.skipif(
+                sys.platform != "darwin", reason="native IOKit boundary"
+            ),
+        ),
+        pytest.param(
+            True,
+            True,
+            False,
+            False,
+            marks=pytest.mark.skipif(
+                sys.platform != "darwin", reason="native IOKit boundary"
+            ),
+        ),
+        pytest.param(
+            True,
+            False,
+            True,
+            False,
+            marks=pytest.mark.skipif(
+                sys.platform != "darwin", reason="native IOKit boundary"
+            ),
+        ),
+        pytest.param(
+            True,
+            False,
+            False,
+            True,
+            marks=pytest.mark.skipif(
+                sys.platform != "darwin", reason="native IOKit boundary"
+            ),
+        ),
+    ],
+)
 async def test_workers_wait_for_all_old_processes_before_replacement(
-    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    drain_enabled: bool,
+    peer_failed: bool,
+    allocation_unreadable: bool,
+    removed_instance: bool,
 ) -> None:
     logger_setup(None)
+    request.addfinalizer(gc.collect)
     request.addfinalizer(logger_cleanup)
+    monkeypatch.setenv("EXO_GPU_DRAIN_ENABLED", "1" if drain_enabled else "0")
+    allocation_permitted = anyio.Event()
+    allocation_rejected = anyio.Event()
+    rejection_checked = anyio.Event()
+    native_library = ctypes.CDLL
+
+    def allocation_value(number: int, value_type: int, output: int) -> bool:
+        if allocation_unreadable:
+            allocation_rejected.set()
+            return False
+        ctypes.cast(output, ctypes.POINTER(ctypes.c_int64))[0] = (
+            0 if allocation_permitted.is_set() else 64 * 1024**3
+        )
+        return True
+
+    allocation_function = ctypes.CFUNCTYPE(
+        ctypes.c_bool, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p
+    )(allocation_value)
+
+    def load_native_library(name: str, *, use_errno: bool = False) -> ctypes.CDLL:
+        library = native_library(name, use_errno=use_errno)
+        if name.endswith("CoreFoundation.framework/CoreFoundation"):
+            library.__dict__["CFNumberGetValue"] = allocation_function
+        return library
+
+    if drain_enabled:
+        monkeypatch.setattr(ctypes, "CDLL", load_native_library)
     node_id = NodeId("global-order-node")
     runner_id = RunnerId("global-order-runner")
     bound_instance = get_bound_mlx_ring_instance(
@@ -380,7 +459,8 @@ async def test_workers_wait_for_all_old_processes_before_replacement(
         daemon: bool | None,
     ) -> BaseProcess:
         if (
-            len(args) > 3
+            not peer_failed
+            and len(args) > 3
             and isinstance(args[3], BoundInstance)
             and args[3].bound_runner_id == peer_runner_id
         ):
@@ -405,6 +485,7 @@ async def test_workers_wait_for_all_old_processes_before_replacement(
     replacement_planned = False
     failed_shutdown_task_id: TaskId | None = None
     shutdown_statuses: dict[TaskId, TaskStatus] = {}
+    terminal_runners: set[RunnerId] = set()
     event_index = 0
 
     async def observe_peer_exit_ready() -> None:
@@ -412,10 +493,30 @@ async def test_workers_wait_for_all_old_processes_before_replacement(
         peer_exit_ready.set()
 
     async def release_peer_exit() -> None:
-        await peer_exit_ready.wait()
+        if not peer_failed:
+            await peer_exit_ready.wait()
         await failed_worker_ready.wait()
         await anyio.sleep(0.2)
-        release_sender.send(None)
+        if not peer_failed:
+            release_sender.send(None)
+        if drain_enabled:
+            with anyio.fail_after(20):
+                while any(old.runner_process.is_alive() for old in old_supervisors):
+                    await anyio.sleep(0.01)
+            await anyio.sleep(0.5)
+            assert not replacement_planned, (
+                "Replacement admitted while post-stop allocation remained high"
+            )
+            if allocation_unreadable:
+                await allocation_rejected.wait()
+                assert all(
+                    isinstance(worker.state.runners.get(assigned), RunnerShuttingDown)
+                    for worker in workers
+                    for assigned in (runner_id, peer_runner_id)
+                )
+                rejection_checked.set()
+            else:
+                allocation_permitted.set()
 
     with ExitStack() as resources:
         event_sender, event_receiver = channel[Event](max_buffer_size=0)
@@ -454,7 +555,7 @@ async def test_workers_wait_for_all_old_processes_before_replacement(
             workers.append(worker)
             old_supervisors.append(supervisor)
 
-        with anyio.fail_after(60):
+        with anyio.fail_after(180 if drain_enabled else 60):
             async with anyio.create_task_group() as task_group:
                 try:
                     for supervisor in old_supervisors:
@@ -475,8 +576,12 @@ async def test_workers_wait_for_all_old_processes_before_replacement(
                                 "runners": initial_statuses,
                             }
                         )
-                    os.kill(old_supervisors[0].runner_process.pid, signal.SIGTERM)
-                    while True:
+                    if not removed_instance:
+                        os.kill(old_supervisors[0].runner_process.pid, signal.SIGTERM)
+                    if peer_failed:
+                        os.kill(old_supervisors[1].runner_process.pid, signal.SIGTERM)
+                    failures_observed: set[RunnerId] = set()
+                    while not removed_instance:
                         event = await event_receiver.receive()
                         if isinstance(event, RunnerStatusUpdated) and isinstance(
                             event.runner_status, RunnerFailed
@@ -490,13 +595,49 @@ async def test_workers_wait_for_all_old_processes_before_replacement(
                                         }
                                     }
                                 )
-                            break
-                    assert not old_supervisors[0].runner_process.is_alive()
-                    task_group.start_soon(observe_peer_exit_ready)
+                            failures_observed.add(event.runner_id)
+                            if len(failures_observed) == (2 if peer_failed else 1):
+                                break
+                    if not removed_instance:
+                        assert not old_supervisors[0].runner_process.is_alive()
+                    if not peer_failed:
+                        task_group.start_soon(observe_peer_exit_ready)
                     task_group.start_soon(release_peer_exit)
                     task_group.start_soon(workers[1].run)
+                    if drain_enabled:
+                        task_group.start_soon(workers[0].run)
+                        failed_worker_started = True
+                        failed_worker_ready.set()
+                    if removed_instance:
+                        for worker, indexed_sender in zip(
+                            workers, indexed_senders, strict=True
+                        ):
+                            await indexed_sender.send(
+                                IndexedEvent(
+                                    idx=event_index,
+                                    event=InstanceDeleted(
+                                        instance_id=bound_instance.instance.instance_id
+                                    ),
+                                )
+                            )
+                            with anyio.fail_after(2):
+                                while worker.state.last_event_applied_idx < event_index:
+                                    await anyio.sleep(0)
+                        event_index += 1
                     while True:
-                        event = await event_receiver.receive()
+                        event: Event | None = None
+                        with anyio.move_on_after(0.05):
+                            event = await event_receiver.receive()
+                        if event is None:
+                            if rejection_checked.is_set():
+                                assert not replacement_planned
+                                assert failed_shutdown_task_id is not None
+                                assert (
+                                    shutdown_statuses.get(failed_shutdown_task_id)
+                                    == TaskStatus.Complete
+                                )
+                                break
+                            continue
                         if (
                             isinstance(event, TaskCreated)
                             and isinstance(event.task, Shutdown)
@@ -506,6 +647,8 @@ async def test_workers_wait_for_all_old_processes_before_replacement(
                         if isinstance(event, TaskStatusUpdated):
                             shutdown_statuses[event.task_id] = event.task_status
                         if isinstance(event, RunnerStatusUpdated):
+                            if isinstance(event.runner_status, RunnerShutdown):
+                                terminal_runners.add(event.runner_id)
                             if event.runner_id == peer_runner_id:
                                 if isinstance(event.runner_status, RunnerShuttingDown):
                                     peer_shutting_down = True
@@ -538,6 +681,9 @@ async def test_workers_wait_for_all_old_processes_before_replacement(
                         if isinstance(event, TaskCreated) and isinstance(
                             event.task, CreateRunner
                         ):
+                            assert not drain_enabled or allocation_permitted.is_set(), (
+                                "Replacement admitted before post-stop allocation release"
+                            )
                             assert all(
                                 not old.runner_process.is_alive()
                                 for old in old_supervisors
@@ -550,12 +696,36 @@ async def test_workers_wait_for_all_old_processes_before_replacement(
                                 await indexed_sender.send(
                                     IndexedEvent(idx=event_index, event=event)
                                 )
+                                with anyio.fail_after(2):
+                                    while (
+                                        worker.state.last_event_applied_idx
+                                        < event_index
+                                    ):
+                                        await anyio.sleep(0)
                             else:
                                 worker.state = workers[1].state
                         event_index += 1
+                        if removed_instance and terminal_runners == {
+                            runner_id,
+                            peer_runner_id,
+                        }:
+                            assert not replacement_planned
+                            assert all(
+                                not old.runner_process.is_alive()
+                                for old in old_supervisors
+                            )
+                            assert failed_shutdown_task_id is not None
+                            assert (
+                                shutdown_statuses.get(failed_shutdown_task_id)
+                                == TaskStatus.Complete
+                            )
+                            break
                         if peer_shutting_down and not failed_worker_started:
-                            await peer_exit_ready.wait()
-                            assert old_supervisors[1].runner_process.is_alive()
+                            if peer_failed:
+                                assert not old_supervisors[1].runner_process.is_alive()
+                            else:
+                                await peer_exit_ready.wait()
+                                assert old_supervisors[1].runner_process.is_alive()
                             workers[0].state = workers[1].state
                             task_group.start_soon(workers[0].run)
                             failed_worker_started = True
