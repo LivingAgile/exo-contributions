@@ -1,12 +1,16 @@
 from typing import Any
 
+import pytest
+
 import exo.worker.plan as plan_mod
 from exo.shared.types.tasks import Shutdown
 from exo.shared.types.worker.instances import BoundInstance, Instance, InstanceId
 from exo.shared.types.worker.runners import (
     RunnerFailed,
     RunnerId,
+    RunnerIdle,
     RunnerReady,
+    RunnerRunning,
     RunnerStatus,
 )
 from exo.utils.keyed_backoff import KeyedBackoff
@@ -143,6 +147,58 @@ def test_plan_creates_runner_when_missing_for_node():
     assert isinstance(result.bound_instance, BoundInstance)
     assert result.bound_instance.instance is instance
     assert result.bound_instance.bound_runner_id == RUNNER_1_ID
+
+
+@pytest.mark.parametrize(
+    ("local_failed", "peer_status", "should_create"),
+    [
+        (True, RunnerRunning(), False),
+        (False, None, True),
+        (True, RunnerFailed(diagnostics=[]), True),
+        (True, RunnerIdle(), True),
+    ],
+    ids=["running-peer", "initial-creation", "all-failed", "new-idle-peer"],
+)
+def test_plan_waits_for_old_peer_before_failed_runner_recreation(
+    local_failed: bool, peer_status: RunnerStatus | None, should_create: bool
+):
+    instance = get_mlx_ring_instance(
+        instance_id=INSTANCE_1_ID,
+        model_id=MODEL_A_ID,
+        node_to_runner={NODE_A: RUNNER_1_ID, NODE_B: RUNNER_2_ID},
+        runner_to_shard={
+            RUNNER_1_ID: get_pipeline_shard_metadata(
+                MODEL_A_ID, device_rank=0, world_size=2
+            ),
+            RUNNER_2_ID: get_pipeline_shard_metadata(
+                MODEL_A_ID, device_rank=1, world_size=2
+            ),
+        },
+    )
+    all_runners: dict[RunnerId, RunnerStatus] = {}
+    if local_failed:
+        all_runners[RUNNER_1_ID] = RunnerFailed(diagnostics=[])
+    if peer_status is not None:
+        all_runners[RUNNER_2_ID] = peer_status
+
+    result = plan_mod.plan(
+        node_id=NODE_A,
+        runners={},
+        global_download_status={},
+        instances={INSTANCE_1_ID: instance},
+        all_runners=all_runners,
+        tasks={},
+        input_chunk_buffer={},
+        image_cache={},
+        instance_backoff=KeyedBackoff(),
+        download_backoff=KeyedBackoff(),
+    )
+
+    if should_create:
+        assert isinstance(result, plan_mod.CreateRunner)
+        assert result.bound_instance.bound_runner_id == RUNNER_1_ID
+    else:
+        assert result is None
 
 
 def test_plan_does_not_create_runner_when_supervisor_already_present():

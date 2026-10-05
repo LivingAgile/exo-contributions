@@ -351,12 +351,13 @@ class RunnerSupervisor:
                         )
                         self.in_progress.pop(event.task_id, None)
                         self.completed.add(event.task_id)
-                    await self._event_sender.send(event)
                     if isinstance(event, RunnerStatusUpdated) and isinstance(
                         event.runner_status, RunnerShutdown
                     ):
                         for task_id in self.pending.keys() & self.completed:
                             self.pending.pop(task_id).set()
+                        continue
+                    await self._event_sender.send(event)
         except (ClosedResourceError, BrokenResourceError):
             # this is the happy path shutdown - we don't need to spam log with it
             await self._check_runner()

@@ -30,6 +30,7 @@ from exo.shared.types.events import (
     InstanceDeleted,
     NodeDownloadProgress,
     NodeGatheredInfo,
+    RunnerStatusUpdated,
     TaskCreated,
     TaskStatusUpdated,
     TopologyEdgeCreated,
@@ -52,7 +53,7 @@ from exo.shared.types.text_generation import Base64Image, Base64ImageHash
 from exo.shared.types.topology import Connection, SocketConnection
 from exo.shared.types.worker.downloads import DownloadCompleted
 from exo.shared.types.worker.instances import InstanceId
-from exo.shared.types.worker.runners import RunnerId
+from exo.shared.types.worker.runners import RunnerFailed, RunnerId, RunnerShutdown
 from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.info_gatherer.info_gatherer import GatheredInfo, InfoGatherer
 from exo.utils.info_gatherer.net_profile import check_reachable
@@ -293,6 +294,13 @@ class Worker:
                         runner.shutdown()
                         with anyio.CancelScope(shield=True):
                             await runner.runner_process.stop()
+                        if not isinstance(runner.status, RunnerFailed):
+                            await self.event_sender.send(
+                                RunnerStatusUpdated(
+                                    runner_id=runner_id,
+                                    runner_status=RunnerShutdown(),
+                                )
+                            )
                 case CancelTask(
                     cancelled_task_id=cancelled_task_id, runner_id=runner_id
                 ):

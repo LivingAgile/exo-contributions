@@ -37,6 +37,7 @@ from exo.shared.types.worker.runners import (
     RunnerLoading,
     RunnerReady,
     RunnerRunning,
+    RunnerShuttingDown,
     RunnerStatus,
     RunnerWarmingUp,
 )
@@ -123,6 +124,25 @@ def _create_runner(
         )
         we_have_failed_before = isinstance(all_runners.get(runner_id), RunnerFailed)
         if instance_has_failed_runner and not we_have_failed_before:
+            continue
+
+        if (instance_has_failed_runner or we_have_failed_before) and any(
+            isinstance(
+                all_runners.get(remote_runner_id),
+                (
+                    RunnerConnecting,
+                    RunnerConnected,
+                    RunnerLoading,
+                    RunnerLoaded,
+                    RunnerWarmingUp,
+                    RunnerReady,
+                    RunnerRunning,
+                    RunnerShuttingDown,
+                ),
+            )
+            for remote_runner_id in instance.shard_assignments.node_to_runner.values()
+            if remote_runner_id != runner_id
+        ):
             continue
 
         if not instance_backoff.should_proceed(instance.instance_id):

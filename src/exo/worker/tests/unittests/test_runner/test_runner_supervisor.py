@@ -1,5 +1,10 @@
+import contextlib
+import multiprocessing as mp
 import os
 import signal
+from collections.abc import Callable, Mapping
+from contextlib import ExitStack
+from multiprocessing.process import BaseProcess
 from typing import cast
 
 import anyio
@@ -38,13 +43,30 @@ from exo.shared.types.worker.runners import (
     RunnerIdle,
     RunnerShutdown,
     RunnerShuttingDown,
+    RunnerStatus,
 )
 from exo.utils.async_process import AsyncProcess
-from exo.utils.channels import channel, mp_channel
+from exo.utils.channels import MpReceiver, MpSender, Sender, channel, mp_channel
 from exo.worker.main import Worker
 from exo.worker.runner.bootstrap import RunnerTerminationError
 from exo.worker.runner.supervisor import RunnerStdioHandler, RunnerSupervisor
 from exo.worker.tests.unittests.conftest import get_bound_mlx_ring_instance
+
+
+def _process_with_exit_gate(
+    target: Callable[..., object],
+    target_args: tuple[object, ...],
+    target_kwargs: Mapping[str, object],
+    ready_sender: MpSender[None],
+    release_receiver: MpReceiver[None],
+) -> None:
+    target(*target_args, **target_kwargs)
+    try:
+        ready_sender.send(None)
+        release_receiver.receive()
+    finally:
+        ready_sender.close()
+        release_receiver.close()
 
 
 class _DeadProcess:
@@ -314,3 +336,216 @@ async def test_worker_waits_for_old_process_before_planning_replacement(
                     os.kill(supervisor.runner_process.pid, signal.SIGCONT)
                 supervisor.shutdown()
                 task_group.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGTERM"), reason="requires native child termination"
+)
+async def test_workers_wait_for_all_old_processes_before_replacement(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    logger_setup(None)
+    request.addfinalizer(logger_cleanup)
+    node_id = NodeId("global-order-node")
+    runner_id = RunnerId("global-order-runner")
+    bound_instance = get_bound_mlx_ring_instance(
+        instance_id=InstanceId("global-order-instance"),
+        model_id=ModelId("mlx-community/Llama-3.2-1B-Instruct-4bit"),
+        runner_id=runner_id,
+        node_id=node_id,
+    )
+    peer_node_id, peer_runner_id = next(
+        (assigned_node, assigned_runner)
+        for assigned_node, assigned_runner in (
+            bound_instance.instance.shard_assignments.node_to_runner.items()
+        )
+        if assigned_runner != runner_id
+    )
+    peer_instance = BoundInstance(
+        instance=bound_instance.instance,
+        bound_node_id=peer_node_id,
+        bound_runner_id=peer_runner_id,
+    )
+    ready_sender, ready_receiver = mp_channel[None]()
+    release_sender, release_receiver = mp_channel[None]()
+    native_process = mp.Process
+
+    def create_native_process(
+        *,
+        target: Callable[..., object],
+        name: str | None,
+        args: tuple[object, ...],
+        kwargs: Mapping[str, object],
+        daemon: bool | None,
+    ) -> BaseProcess:
+        if (
+            len(args) > 3
+            and isinstance(args[3], BoundInstance)
+            and args[3].bound_runner_id == peer_runner_id
+        ):
+            return native_process(
+                target=_process_with_exit_gate,
+                name=name,
+                args=(target, args, kwargs, ready_sender, release_receiver),
+                daemon=daemon,
+            )
+        return native_process(
+            target=target, name=name, args=args, kwargs=kwargs, daemon=daemon
+        )
+
+    monkeypatch.setattr(mp, "Process", create_native_process)
+    workers: list[Worker] = []
+    indexed_senders: list[Sender[IndexedEvent]] = []
+    old_supervisors: list[RunnerSupervisor] = []
+    peer_exit_ready = anyio.Event()
+    failed_worker_ready = anyio.Event()
+    peer_shutting_down = False
+    failed_worker_started = False
+    replacement_planned = False
+    event_index = 0
+
+    async def observe_peer_exit_ready() -> None:
+        await ready_receiver.receive_async()
+        peer_exit_ready.set()
+
+    async def release_peer_exit() -> None:
+        await peer_exit_ready.wait()
+        await failed_worker_ready.wait()
+        await anyio.sleep(0.2)
+        release_sender.send(None)
+
+    with ExitStack() as resources:
+        event_sender, event_receiver = channel[Event](max_buffer_size=0)
+        command_sender, command_receiver = channel[ForwarderCommand]()
+        download_sender, download_receiver = channel[ForwarderDownloadCommand]()
+        for resource in (
+            event_sender,
+            event_receiver,
+            command_sender,
+            command_receiver,
+            download_sender,
+            download_receiver,
+            ready_sender,
+            ready_receiver,
+            release_sender,
+            release_receiver,
+        ):
+            resources.enter_context(resource)
+        for assigned in (bound_instance, peer_instance):
+            indexed_sender, indexed_receiver = channel[IndexedEvent]()
+            resources.enter_context(indexed_sender)
+            resources.enter_context(indexed_receiver)
+            indexed_senders.append(indexed_sender)
+            worker = Worker(
+                assigned.bound_node_id,
+                event_receiver=indexed_receiver,
+                event_sender=event_sender.clone(),
+                command_sender=command_sender.clone(),
+                download_command_sender=download_sender.clone(),
+                api_port=0,
+            )
+            supervisor = await RunnerSupervisor.create(
+                bound_instance=assigned, event_sender=event_sender.clone()
+            )
+            worker.runners[assigned.bound_runner_id] = supervisor
+            workers.append(worker)
+            old_supervisors.append(supervisor)
+
+        with anyio.fail_after(60):
+            async with anyio.create_task_group() as task_group:
+                try:
+                    for supervisor in old_supervisors:
+                        task_group.start_soon(supervisor.run)
+                    initial_statuses: dict[RunnerId, RunnerStatus] = {}
+                    while len(initial_statuses) < 2:
+                        event = await event_receiver.receive()
+                        assert isinstance(event, RunnerStatusUpdated)
+                        initial_statuses[event.runner_id] = event.runner_status
+                    for worker in workers:
+                        worker.state = worker.state.model_copy(
+                            update={
+                                "instances": {
+                                    bound_instance.instance.instance_id: (
+                                        bound_instance.instance
+                                    ),
+                                },
+                                "runners": initial_statuses,
+                            }
+                        )
+                    os.kill(old_supervisors[0].runner_process.pid, signal.SIGTERM)
+                    while True:
+                        event = await event_receiver.receive()
+                        if isinstance(event, RunnerStatusUpdated) and isinstance(
+                            event.runner_status, RunnerFailed
+                        ):
+                            for worker in workers:
+                                worker.state = worker.state.model_copy(
+                                    update={
+                                        "runners": {
+                                            **worker.state.runners,
+                                            event.runner_id: event.runner_status,
+                                        }
+                                    }
+                                )
+                            break
+                    assert not old_supervisors[0].runner_process.is_alive()
+                    task_group.start_soon(observe_peer_exit_ready)
+                    task_group.start_soon(release_peer_exit)
+                    task_group.start_soon(workers[1].run)
+                    while True:
+                        event = await event_receiver.receive()
+                        if isinstance(event, RunnerStatusUpdated):
+                            if event.runner_id == peer_runner_id:
+                                if isinstance(event.runner_status, RunnerShuttingDown):
+                                    peer_shutting_down = True
+                                if isinstance(event.runner_status, RunnerShutdown):
+                                    assert not old_supervisors[
+                                        1
+                                    ].runner_process.is_alive()
+                            if (
+                                event.runner_id == runner_id
+                                and isinstance(event.runner_status, RunnerIdle)
+                                and replacement_planned
+                            ):
+                                assert all(
+                                    not old.runner_process.is_alive()
+                                    for old in old_supervisors
+                                )
+                                assert workers[0].runners[
+                                    runner_id
+                                ].runner_process.pid != (
+                                    old_supervisors[0].runner_process.pid
+                                )
+                                break
+                        if isinstance(event, TaskCreated) and isinstance(
+                            event.task, CreateRunner
+                        ):
+                            assert all(
+                                not old.runner_process.is_alive()
+                                for old in old_supervisors
+                            ), "Replacement admitted before the old peer process exited"
+                            replacement_planned = True
+                        for worker, indexed_sender in zip(
+                            workers, indexed_senders, strict=True
+                        ):
+                            if worker is workers[1] or failed_worker_started:
+                                await indexed_sender.send(
+                                    IndexedEvent(idx=event_index, event=event)
+                                )
+                            else:
+                                worker.state = workers[1].state
+                        event_index += 1
+                        if peer_shutting_down and not failed_worker_started:
+                            await peer_exit_ready.wait()
+                            assert old_supervisors[1].runner_process.is_alive()
+                            workers[0].state = workers[1].state
+                            task_group.start_soon(workers[0].run)
+                            failed_worker_started = True
+                            failed_worker_ready.set()
+                finally:
+                    with contextlib.suppress(Exception):
+                        release_sender.send(None)
+                    for supervisor in old_supervisors:
+                        supervisor.shutdown()
+                    task_group.cancel_scope.cancel()
