@@ -2,6 +2,7 @@ import copy
 import gc
 import json
 import weakref
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,6 +15,7 @@ from mlx_lm.tokenizer_utils import TokenizerWrapper
 from mlx_vlm.models.cache import ArraysCache as VlmArraysCache
 from mlx_vlm.models.cache import CacheList as VlmCacheList
 from mlx_vlm.models.cache import KVCache as VlmKVCache
+from mlx_vlm.models.glm5_next import language as native_language
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
@@ -41,6 +43,49 @@ from exo.worker.engines.mlx.types import Model as ExoModel
 from exo.worker.engines.mlx.utils_mlx import load_model_for_exo
 from exo.worker.runner.llm_inference.batch_generator import SequentialGenerator
 from exo.worker.tests.unittests.test_mlx.test_tp_bit_exact import MODEL_CONFIGS
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_flash_sparse_prefill_fallback_bounds_tile_memory(dtype: mx.Dtype):
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Peak allocation requires the native GPU device")
+    mx.random.seed(42)
+    queries = mx.random.normal((1, 8, 256, 256)).astype(dtype)
+    keys = mx.random.normal((1, 8, 4096, 256)).astype(dtype)
+    values = mx.random.normal((1, 8, 4096, 256)).astype(dtype)
+    indices = mx.broadcast_to(mx.arange(512, dtype=mx.int32)[None, None], (1, 256, 512))
+    mx.eval(queries, keys, values, indices)
+    gc.collect()
+    mx.synchronize()
+    mx.clear_cache()
+    baseline = mx.get_active_memory()
+    mx.reset_peak_memory()
+    sparse_prefill_attention = cast(
+        Callable[[mx.array, mx.array, mx.array, mx.array, float], mx.array],
+        vars(native_language)["_sparse_prefill_attention"],
+    )
+    actual = sparse_prefill_attention(queries, keys, values, indices, 0.0625)
+    mx.eval(actual)
+    mx.synchronize()
+    extra_peak = mx.get_peak_memory() - baseline
+    reference_tiles: list[mx.array] = []
+    for query_index in range(queries.shape[2]):
+        reference = sparse_prefill_attention(
+            queries[:, :, query_index : query_index + 1],
+            keys,
+            values,
+            indices[:, query_index : query_index + 1],
+            0.0625,
+        )
+        mx.eval(reference)
+        reference_tiles.append(reference)
+    expected = mx.concatenate(reference_tiles, axis=2)
+    mx.eval(expected)
+    assert actual.dtype == dtype
+    assert actual.shape == (1, 8, 256, 256)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+    gathered_tile_bytes = 2 * 16 * 8 * 512 * 256 * 4
+    assert extra_peak < 2 * gathered_tile_bytes
 
 
 @pytest.mark.parametrize("cache_family", ["arrays", "vlm_arrays", "vlm_list"])

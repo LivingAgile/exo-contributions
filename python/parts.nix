@@ -60,6 +60,11 @@ let
             cp -R ${flashVlmSource}/mlx_vlm/. \
               $out/${final.python.sitePackages}/mlx_vlm/
             chmod -R u+w $out/${final.python.sitePackages}/mlx_vlm
+            local sparsePrefillSource=$out/${final.python.sitePackages}/mlx_vlm/models/glm5_next/language.py
+            local sparsePrefillAppend=$'        outputs.append(\n            out.reshape(batch, chunk_length, heads, v.shape[-1]).transpose(0, 2, 1, 3)\n        )'
+            test "$(grep -Fxc '            out.reshape(batch, chunk_length, heads, v.shape[-1]).transpose(0, 2, 1, 3)' "$sparsePrefillSource")" -eq 1
+            substituteInPlace "$sparsePrefillSource" \
+              --replace-fail "$sparsePrefillAppend" $'        mx.eval(out)\n'"$sparsePrefillAppend"
             install -Dm644 ${../nix/muse-glimmer/mlx_vlm/models/activations.py} \
               $out/${final.python.sitePackages}/mlx_vlm/models/activations.py
             install -Dm644 ${../nix/muse-glimmer/mlx_vlm/models/rope_utils.py} \
