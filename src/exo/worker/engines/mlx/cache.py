@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, cast
 import mlx.core as mx
 import numpy as np
 import psutil
+from mlx.utils import tree_map
 from mlx_lm.models.cache import (
     ArraysCache,
     CacheList,
@@ -110,7 +111,7 @@ def _copy_arrays_cache(ac: ArraysCache) -> ArraysCache:
             continue
         assert isinstance(entry, mx.array)
         entries.append(_detached_copy(entry))
-    copy = ArraysCache(len(entries))
+    copy = deepcopy(ac)
     copy.cache = entries  # type: ignore[reportUnknownMemberType]
     return copy
 
@@ -192,7 +193,21 @@ def copy_snapshot_entry(
 ):
     match entry:
         case VlmArraysCache() | VlmCacheList():
-            return deepcopy(entry)
+            copy = deepcopy(entry)
+
+            def detach_state(value: object) -> object:
+                return (
+                    _detached_copy_or_none(value)
+                    if isinstance(value, mx.array)
+                    else value
+                )
+
+            state = cast(list[object], tree_map(detach_state, entry.state))
+            if isinstance(copy, VlmArraysCache):
+                copy.state = cast(list[mx.array | None], state)
+            else:
+                copy.state = state
+            return copy
         case None:
             return None
         case RotatingKVCache():
@@ -218,7 +233,7 @@ def snapshot_ssm_states(cache: KVCacheType) -> CacheSnapshot:
     ] = []
     for c in cache:
         if isinstance(c, (VlmArraysCache, VlmCacheList)):
-            states.append(deepcopy(c))
+            states.append(copy_snapshot_entry(c))
         elif isinstance(c, ArraysCache):
             states.append(_copy_arrays_cache(c))
         elif isinstance(c, RotatingKVCache):
@@ -514,7 +529,9 @@ def trim_cache(
         if isinstance(c, (VlmArraysCache, VlmCacheList)):
             if snapshot is None or snapshot.states[i] is None:
                 raise ValueError("MLX-VLM cache rollback requires a snapshot")
-            cast(MutableSequence[object], cache)[i] = deepcopy(snapshot.states[i])
+            cast(MutableSequence[object], cache)[i] = copy_snapshot_entry(
+                snapshot.states[i]
+            )
             continue
         non_trimmable = isinstance(c, (ArraysCache, RotatingKVCache)) or (
             isinstance(c, CacheList) and not bool(c.is_trimmable())  # type: ignore[reportUnknownMemberType]

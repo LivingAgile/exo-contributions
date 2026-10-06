@@ -1,4 +1,5 @@
 import copy
+import gc
 import json
 import weakref
 from pathlib import Path
@@ -8,7 +9,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 from mlx.utils import tree_flatten
+from mlx_lm.models.cache import ArraysCache
 from mlx_lm.tokenizer_utils import TokenizerWrapper
+from mlx_vlm.models.cache import ArraysCache as VlmArraysCache
 from mlx_vlm.models.cache import CacheList as VlmCacheList
 from mlx_vlm.models.cache import KVCache as VlmKVCache
 from tokenizers import Tokenizer
@@ -25,6 +28,7 @@ from exo.worker.engines.mlx.builder import MlxBuilder
 from exo.worker.engines.mlx.cache import (
     CacheSnapshot,
     KVPrefixCache,
+    copy_snapshot_entry,
     has_non_kv_caches,
     snapshot_ssm_states,
     trim_cache,
@@ -37,6 +41,80 @@ from exo.worker.engines.mlx.types import Model as ExoModel
 from exo.worker.engines.mlx.utils_mlx import load_model_for_exo
 from exo.worker.runner.llm_inference.batch_generator import SequentialGenerator
 from exo.worker.tests.unittests.test_mlx.test_tp_bit_exact import MODEL_CONFIGS
+
+
+@pytest.mark.parametrize("cache_family", ["arrays", "vlm_arrays", "vlm_list"])
+@pytest.mark.parametrize("entrypoint", ["copy", "snapshot", "restore"])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_snapshot_detaches_backing_and_preserves_metadata(
+    cache_family: str, entrypoint: str, dtype: mx.Dtype
+):
+    if mx.default_device() != mx.gpu:
+        pytest.skip("GPU allocation ownership requires the native GPU device")
+    warmup = mx.zeros((32, 32))
+    mx.eval(warmup)
+    del warmup
+    gc.collect()
+    mx.clear_cache()
+    baseline = mx.get_active_memory()
+    backing = mx.full((8192, 512), 7, dtype=dtype)
+    mx.eval(backing)
+    original_entry: ArraysCache | VlmArraysCache | VlmCacheList
+    if cache_family == "vlm_list":
+        keys_cache = VlmKVCache()
+        keys_cache.keys = backing[None, None, :1, :]
+        keys_cache.values = mx.zeros((1, 1, 1, 0), dtype=dtype)
+        keys_cache.offset = 1
+        original_entry = VlmCacheList(keys_cache)
+        del keys_cache
+    else:
+        arrays_cache = (
+            ArraysCache(size=2) if cache_family == "arrays" else VlmArraysCache(size=2)
+        )
+        arrays_cache.state = [backing[:1, :], None]
+        arrays_cache.left_padding = mx.array([3])
+        arrays_cache.lengths = mx.array([9])
+        original_entry = arrays_cache
+        del arrays_cache
+    original_cache: KVCacheType = [original_entry]
+    if entrypoint == "copy":
+        copied_entry = copy_snapshot_entry(original_entry)
+    elif entrypoint == "snapshot":
+        captured = snapshot_ssm_states(original_cache)
+        copied_entry = captured.states[0]
+        del captured
+    else:
+        captured = CacheSnapshot([original_entry], token_count=1)
+        trim_cache(original_cache, 0, captured)
+        copied_entry = original_cache[0]
+        del captured
+    assert copied_entry is not None
+    assert type(copied_entry) is type(original_entry)
+    if isinstance(copied_entry, VlmCacheList):
+        copied_keys = cast(VlmKVCache, list(copied_entry)[0])
+        copied_array = copied_keys.keys
+        assert copied_keys.offset == 1
+        assert copied_array is not None
+        assert copied_array.shape == (1, 1, 1, 512)
+        del copied_keys
+    else:
+        copied_arrays = cast(ArraysCache | VlmArraysCache, copied_entry)
+        assert copied_arrays.left_padding is not None
+        assert copied_arrays.lengths is not None
+        assert copied_arrays.left_padding.tolist() == [3]
+        assert copied_arrays.lengths.tolist() == [9]
+        assert copied_arrays.state[1] is None
+        copied_array = copied_arrays.state[0]
+        assert isinstance(copied_array, mx.array)
+        assert copied_array.shape == (1, 512)
+        del copied_arrays
+    mx.eval(copied_array)
+    assert copied_array.dtype == dtype
+    assert mx.all(mx.equal(copied_array, 7)).item()
+    del original_entry, original_cache, backing
+    gc.collect()
+    mx.clear_cache()
+    assert mx.get_active_memory() - baseline < 1024 * 1024
 
 
 @pytest.mark.parametrize("quantized", [False, True])
