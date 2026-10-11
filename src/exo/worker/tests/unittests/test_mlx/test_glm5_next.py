@@ -328,3 +328,38 @@ def test_flash_production_generation_prefix_reuse(monkeypatch: pytest.MonkeyPatc
         ]
         assert results[0]
         assert results[0] == results[1]
+    long_prefix = KVPrefixCache(None)
+    for prompt in (
+        " ".join(["one"] * 1008),
+        " ".join(["one"] * 1008 + ["two"] * 32),
+        " ".join(["one"] * 1008 + ["two"] * 32 + ["three"] * 32),
+        " ".join(["one"] * 1008 + ["two"] * 32 + ["four"] * 32),
+        " ".join(["one"] * 1008 + ["four"] * 32),
+    ):
+        results = [
+            [
+                response.token
+                for response in mlx_generate(
+                    model=model,
+                    tokenizer=tokenizer,
+                    task=task,
+                    prompt=prompt,
+                    kv_prefix_cache=cache,
+                    group=None,
+                )
+            ]
+            for cache in (None, long_prefix)
+        ]
+        assert results[0]
+        assert results[0] == results[1]
+        retained_groups = cast(
+            list[list[CacheSnapshot] | None], vars(long_prefix)["_snapshots"]
+        )
+        assert retained_groups
+        for retained in retained_groups:
+            assert retained is not None
+            assert len(retained) <= 2
+            for checkpoint in retained:
+                for entry in checkpoint.states:
+                    if isinstance(entry, VlmCacheList):
+                        assert cast(VlmKVCache, list(entry)[-1]).size() == 0

@@ -330,7 +330,9 @@ class KVPrefixCache:
         old_snapshots = self._snapshots[index]
         merged: list[CacheSnapshot] = []
         if old_snapshots:
-            merged = [s for s in old_snapshots if s.token_count <= restore_pos]
+            nearest = _find_nearest_snapshot(old_snapshots, restore_pos)
+            if nearest is not None:
+                merged.append(nearest)
         if snapshots:
             merged.extend(snapshots)
 
