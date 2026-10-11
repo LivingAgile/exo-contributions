@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 import anyio
 from anyio import fail_after, to_thread
+from anyio.abc import TaskGroup as AnyioTaskGroup
 from loguru import logger
 
 from exo.api.types import ImageEditsTaskParams
@@ -255,6 +256,10 @@ class Worker:
                     await card_cache.pop(card.model_id)
 
     async def plan_step(self):
+        async with anyio.create_task_group() as generation_tasks:
+            await self._plan_tasks(generation_tasks)
+
+    async def _plan_tasks(self, generation_tasks: AnyioTaskGroup):
         while True:
             await anyio.sleep(0.1)
             task: Task | None = plan(
@@ -455,13 +460,15 @@ class Worker:
                         del self.input_chunk_buffer[cmd_id]
                     if cmd_id in self.input_chunk_counts:
                         del self.input_chunk_counts[cmd_id]
-                    await self._start_runner_task(modified_task)
+                    generation_tasks.start_soon(self._start_runner_task, modified_task)
                 case LoadModel(instance_id=instance_id):
                     if (instance := self.state.instances.get(instance_id)) is not None:
                         model_id = instance.shard_assignments.model_id
                         self._download_backoff.reset(model_id)
 
                     await self._start_runner_task(task)
+                case TextGeneration():
+                    generation_tasks.start_soon(self._start_runner_task, task)
                 case task:
                     await self._start_runner_task(task)
 

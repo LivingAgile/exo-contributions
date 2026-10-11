@@ -1,6 +1,7 @@
 import copy
 import gc
 import json
+import time
 import weakref
 from collections.abc import Callable
 from pathlib import Path
@@ -21,10 +22,16 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
-from exo.shared.types.common import ModelId
+from exo.shared.types.common import CommandId, ModelId
 from exo.shared.types.events import Event
-from exo.shared.types.tasks import TaskId
-from exo.shared.types.text_generation import TextGenerationTaskParams
+from exo.shared.types.tasks import TaskId, TextGeneration
+from exo.shared.types.text_generation import (
+    InputMessage,
+    InputMessageContent,
+    TextGenerationTaskParams,
+)
+from exo.shared.types.worker.instances import InstanceId
+from exo.shared.types.worker.runner_response import CancelledResponse, FinishedResponse
 from exo.utils.channels import MpReceiver, MpSender, MpState
 from exo.worker.engines.mlx.builder import MlxBuilder
 from exo.worker.engines.mlx.cache import (
@@ -247,6 +254,111 @@ def test_flash_strict_loading_and_prefix_restore(tmp_path: Path, quantized: bool
     mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
     with pytest.raises(ValueError, match="lm_head.weight"):
         load_model_for_exo(tmp_path)
+
+
+@pytest.mark.parametrize("cancel_before_submit", [False, True])
+def test_flash_sequential_cancellation_survives_registration_and_prefill(
+    cancel_before_submit: bool,
+):
+    configuration = cast(dict[str, Any], MODEL_CONFIGS["glm5_next"]["args"])
+    mx.random.seed(42)
+    module: nn.Module = Model(ModelArgs.from_dict(configuration))
+    model = cast(ExoModel, cast(object, module))
+    native_tokenizer = Tokenizer(WordLevel({"[UNK]": 0, "one": 1}, unk_token="[UNK]"))
+    native_tokenizer.pre_tokenizer = Whitespace()
+    tokenizer = TokenizerWrapper(
+        PreTrainedTokenizerFast(
+            tokenizer_object=native_tokenizer,
+            unk_token="[UNK]",
+            eos_token="[UNK]",
+            chat_template="{{ messages[0]['content'] }}",
+        )
+    )
+    tasks = [
+        TextGeneration(
+            task_id=TaskId(identifier),
+            instance_id=InstanceId("cancel-retention-instance"),
+            command_id=CommandId(identifier),
+            task_params=TextGenerationTaskParams(
+                model=ModelId("test"),
+                input=[
+                    InputMessage(
+                        role="user", content=InputMessageContent(" ".join(["one"] * 32))
+                    )
+                ],
+                max_output_tokens=1,
+                temperature=0.0,
+                bench=True,
+            ),
+        )
+        for identifier in (
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+        )
+    ]
+    cancellation_state = MpState[TaskId](0)
+    with (
+        MpSender(cancellation_state) as cancel_sender,
+        MpReceiver(cancellation_state) as cancel_receiver,
+        MpSender(MpState[Event](0)) as event_sender,
+    ):
+        generator = SequentialGenerator(
+            model=model,
+            tokenizer=tokenizer,
+            group=None,
+            kv_prefix_cache=None,
+            tool_parser=None,
+            model_id=ModelId("test"),
+            device_rank=0,
+            cancel_receiver=cancel_receiver,
+            event_sender=event_sender,
+        )
+        target = tasks[1] if cancel_before_submit else tasks[0]
+        generator.submit(tasks[0])
+        cancel_sender.send(target.task_id)
+        deadline = time.monotonic() + 1
+        while cancellation_state.buffer.empty():
+            assert time.monotonic() < deadline, (
+                "Native cancellation input was not flushed"
+            )
+            time.sleep(0.001)
+        target_results: list[object] = []
+        first_finished = False
+        for _ in range(8):
+            rows = list(generator.step())
+            target_results.extend(
+                response for task_id, response in rows if task_id == target.task_id
+            )
+            if any(
+                task_id == tasks[0].task_id
+                and isinstance(response, (CancelledResponse, FinishedResponse))
+                for task_id, response in rows
+            ):
+                first_finished = True
+                break
+        assert first_finished
+        assert cancellation_state.buffer.empty(), (
+            "Production prefill did not consume cancellation"
+        )
+        if cancel_before_submit:
+            generator.submit(target)
+            for _ in range(8):
+                rows = list(generator.step())
+                target_results.extend(
+                    response for task_id, response in rows if task_id == target.task_id
+                )
+                if any(
+                    task_id == target.task_id
+                    and isinstance(response, (CancelledResponse, FinishedResponse))
+                    for task_id, response in rows
+                ):
+                    break
+        assert target_results
+        assert all(
+            isinstance(response, CancelledResponse) for response in target_results
+        ), (
+            "Cancelled prefill or pre-registration task generated output or reported completion"
+        )
 
 
 def test_flash_production_generation_prefix_reuse(monkeypatch: pytest.MonkeyPatch):

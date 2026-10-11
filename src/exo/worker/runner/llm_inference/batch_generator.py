@@ -103,6 +103,7 @@ class SequentialGenerator(Engine):
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
     _maybe_queue: list[TextGeneration] = field(default_factory=list, init=False)
     _maybe_cancel: list[TextGeneration] = field(default_factory=list, init=False)
+    _pending_cancellations: set[TaskId] = field(default_factory=set, init=False)
     _all_tasks: dict[TaskId, TextGeneration] = field(default_factory=dict, init=False)
     _queue: deque[TextGeneration] = field(default_factory=deque, init=False)
     _active: (
@@ -150,8 +151,11 @@ class SequentialGenerator(Engine):
             if task_id == CANCEL_ALL_TASKS:
                 has_cancel_all = True
                 continue
-            if task_id in self._all_tasks:
-                self._maybe_cancel.append(self._all_tasks[task_id])
+            self._pending_cancellations.add(task_id)
+
+        for task_id in self._pending_cancellations & self._all_tasks.keys():
+            self._maybe_cancel.append(self._all_tasks[task_id])
+            self._pending_cancellations.discard(task_id)
 
         if mx_any(has_cancel_all, self.group):
             self._cancelled_tasks.add(CANCEL_ALL_TASKS)
@@ -166,11 +170,11 @@ class SequentialGenerator(Engine):
         tuple[TaskId, GenerationChunk | FinishedResponse | CancelledResponse]
     ]:
         if self._active is None:
+            self.agree_on_cancellations()
             self.agree_on_tasks()
 
-            if self._queue:
-                self._start_next()
-            else:
+            self._start_next()
+            if self._active is None:
                 return map(
                     lambda task: (task, CancelledResponse()), self._cancelled_tasks
                 )
@@ -188,11 +192,15 @@ class SequentialGenerator(Engine):
             while (parsed := next(output_generator, None)) is not None:
                 output.append((task.task_id, parsed))
 
-        except (StopIteration, PrefillCancelled):
+        except StopIteration:
             output.append((task.task_id, FinishedResponse()))
             self._active = None
             if self._queue:
                 self._start_next()
+
+        except PrefillCancelled:
+            output.append((task.task_id, CancelledResponse()))
+            self._active = None
 
         except Exception as e:
             self._send_error(task, e)
@@ -210,6 +218,10 @@ class SequentialGenerator(Engine):
         )
 
     def _start_next(self) -> None:
+        while self._queue and self.should_cancel(self._queue[0].task_id):
+            self._queue.popleft()
+        if not self._queue:
+            return
         task = self._queue.popleft()
         try:
             gen = self._build_generator(task)

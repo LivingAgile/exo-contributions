@@ -5,13 +5,15 @@ import multiprocessing as mp
 import os
 import signal
 import sys
-from collections.abc import Callable, Mapping
+import threading
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import ExitStack
 from multiprocessing.process import BaseProcess
-from typing import cast
+from typing import BinaryIO, cast
 
 import anyio
 import pytest
+from anyio import to_thread
 
 from exo.shared.logging import logger_cleanup, logger_setup
 from exo.shared.models.model_cards import ModelId
@@ -29,6 +31,7 @@ from exo.shared.types.events import (
 )
 from exo.shared.types.tasks import (
     CreateRunner,
+    GenerationTask,
     Shutdown,
     Task,
     TaskId,
@@ -41,18 +44,23 @@ from exo.shared.types.text_generation import (
     TextGenerationTaskParams,
 )
 from exo.shared.types.worker.instances import BoundInstance, InstanceId
+from exo.shared.types.worker.runner_response import FinishedResponse
 from exo.shared.types.worker.runners import (
     RunnerFailed,
     RunnerId,
     RunnerIdle,
+    RunnerReady,
     RunnerShutdown,
     RunnerShuttingDown,
     RunnerStatus,
 )
 from exo.utils.async_process import AsyncProcess
 from exo.utils.channels import MpReceiver, MpSender, Sender, channel, mp_channel
+from exo.worker.disaggregated.server import PrefillRequest
+from exo.worker.engines.base import Builder, Engine
 from exo.worker.main import Worker
 from exo.worker.runner.bootstrap import RunnerTerminationError
+from exo.worker.runner.runner import Runner
 from exo.worker.runner.supervisor import RunnerStdioHandler, RunnerSupervisor
 from exo.worker.tests.unittests.conftest import get_bound_mlx_ring_instance
 
@@ -146,6 +154,203 @@ async def test_check_runner_emits_error_chunk_for_inflight_text_generation() -> 
     event_sender.close()
     with anyio.move_on_after(0.1):
         await event_receiver.aclose()
+
+
+@pytest.mark.anyio
+async def test_worker_cancels_while_queued_generation_awaits_acknowledgement() -> None:
+    compute_entered = threading.Event()
+    compute_released = threading.Event()
+
+    class BlockingCompute(Engine):
+        def __init__(self) -> None:
+            self.task: GenerationTask | None = None
+            self.blocked = False
+            self._cancelled_tasks = set()
+
+        def warmup(self) -> None:
+            pass
+
+        def submit(self, task: GenerationTask) -> None:
+            self.task = task
+
+        def step(self) -> Iterable[tuple[TaskId, FinishedResponse]]:
+            assert self.task is not None
+            if not self.blocked:
+                self.blocked = True
+                compute_entered.set()
+                assert compute_released.wait(10), "Test compute was not released"
+            return [(self.task.task_id, FinishedResponse())]
+
+        def close(self) -> None:
+            compute_released.set()
+
+        def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
+            raise NotImplementedError
+
+    with ExitStack() as resources:
+        event_sender, event_receiver = channel[Event]()
+        indexed_sender, indexed_receiver = channel[IndexedEvent]()
+        command_sender, command_receiver = channel[ForwarderCommand]()
+        download_sender, download_receiver = channel[ForwarderDownloadCommand]()
+        task_sender, task_receiver = mp_channel[Task]()
+        cancel_sender, cancel_receiver = mp_channel[TaskId]()
+        runner_event_sender, runner_event_receiver = mp_channel[
+            Event | RunnerTerminationError
+        ]()
+        for resource in (
+            event_sender,
+            event_receiver,
+            indexed_sender,
+            indexed_receiver,
+            command_sender,
+            command_receiver,
+            download_sender,
+            download_receiver,
+            task_sender,
+            cancel_sender,
+            cancel_receiver,
+            runner_event_sender,
+            runner_event_receiver,
+        ):
+            resources.enter_context(resource)
+        node_id = NodeId("cancel-ack-node")
+        runner_id = RunnerId("cancel-ack-runner")
+        bound = get_bound_mlx_ring_instance(
+            instance_id=InstanceId("cancel-ack-instance"),
+            model_id=ModelId("mlx-community/Llama-3.2-1B-Instruct-4bit"),
+            runner_id=runner_id,
+            node_id=node_id,
+        )
+        worker = Worker(
+            node_id,
+            event_receiver=indexed_receiver,
+            event_sender=event_sender,
+            command_sender=command_sender,
+            download_command_sender=download_sender,
+            api_port=0,
+        )
+        process = cast(AsyncProcess, cast(object, _DeadProcess()))
+        handler = await RunnerStdioHandler.create(
+            stdout_rx=process.stdout, stderr_rx=process.stderr
+        )
+        supervisor = RunnerSupervisor(
+            shard_metadata=bound.bound_shard,
+            bound_instance=bound,
+            runner_process=process,
+            _runner_stdio_handler=handler,
+            initialize_timeout=400,
+            _ev_recv=runner_event_receiver,
+            _task_sender=task_sender,
+            _event_sender=event_sender,
+            _cancel_sender=cancel_sender,
+        )
+        compute = BlockingCompute()
+        runner = Runner(
+            bound,
+            cast(Builder, cast(object, compute)),
+            cast(MpSender[Event], cast(object, runner_event_sender)),
+            task_receiver,
+        )
+        runner.generator = compute
+        runner.update_status(RunnerReady())
+        worker.runners[runner_id] = supervisor
+        tasks = [
+            TextGeneration(
+                task_id=TaskId(name),
+                instance_id=bound.instance.instance_id,
+                command_id=CommandId(name),
+                task_params=TextGenerationTaskParams(
+                    model=bound.bound_shard.model_card.model_id,
+                    input=[
+                        InputMessage(role="user", content=InputMessageContent("hi"))
+                    ],
+                    stream=True,
+                ),
+            )
+            for name in ("active-generation", "queued-generation", "third-generation")
+        ]
+        worker.state = worker.state.model_copy(
+            update={
+                "instances": {bound.instance.instance_id: bound.instance},
+                "runners": {
+                    assigned: RunnerReady()
+                    for assigned in bound.instance.shard_assignments.runner_to_shard
+                },
+                "tasks": {tasks[0].task_id: tasks[0]},
+            }
+        )
+        runner_thread = threading.Thread(target=runner.main)
+        runner_thread.start()
+        try:
+            with anyio.fail_after(8):
+                async with anyio.create_task_group() as task_group:
+                    try:
+                        task_group.start_soon(supervisor._forward_events)  # pyright: ignore[reportPrivateUsage]
+                        while not isinstance(supervisor.status, RunnerReady):
+                            await anyio.sleep(0.01)
+                        task_group.start_soon(worker.plan_step)
+                        while not compute_entered.is_set():
+                            await anyio.sleep(0.01)
+                        worker.state = worker.state.model_copy(
+                            update={
+                                "tasks": {
+                                    **worker.state.tasks,
+                                    tasks[1].task_id: tasks[1],
+                                }
+                            }
+                        )
+                        while tasks[1].task_id not in supervisor.pending:
+                            await anyio.sleep(0.01)
+                        assert not compute_released.is_set()
+                        worker.state = worker.state.model_copy(
+                            update={
+                                "tasks": {
+                                    **worker.state.tasks,
+                                    tasks[2].task_id: tasks[2],
+                                }
+                            }
+                        )
+                        await anyio.sleep(0.25)
+                        assert tasks[2].task_id not in supervisor.in_progress
+                        assert set(supervisor.pending) == {tasks[1].task_id}
+                        worker.state = worker.state.model_copy(
+                            update={
+                                "tasks": {
+                                    task.task_id: task.model_copy(
+                                        update={"task_status": TaskStatus.Cancelled}
+                                    )
+                                    for task in tasks
+                                }
+                            }
+                        )
+                        dispatched: TaskId | None = None
+                        with anyio.move_on_after(1) as cancellation_deadline:
+                            dispatched = await cancel_receiver.receive_async()
+                        assert not cancellation_deadline.cancel_called, (
+                            "Cancellation dispatcher is blocked behind queued generation acknowledgement"
+                        )
+                        assert dispatched in {task.task_id for task in tasks}
+                        assert not compute_released.is_set()
+                    finally:
+                        task_group.start_soon(
+                            supervisor.start_task,
+                            Shutdown(
+                                instance_id=bound.instance.instance_id,
+                                runner_id=runner_id,
+                            ),
+                        )
+                        compute_released.set()
+                        try:
+                            with anyio.CancelScope(shield=True):
+                                await to_thread.run_sync(runner_thread.join, 5)
+                                assert not runner_thread.is_alive()
+                        finally:
+                            task_group.cancel_scope.cancel()
+        finally:
+            compute_released.set()
+            task_sender.close()
+            runner_thread.join(timeout=5)
+            assert not runner_thread.is_alive()
 
 
 @pytest.mark.anyio
