@@ -52,6 +52,84 @@ from exo.worker.runner.llm_inference.batch_generator import SequentialGenerator
 from exo.worker.tests.unittests.test_mlx.test_tp_bit_exact import MODEL_CONFIGS
 
 
+def test_flash_mixed_weights_prefill_uses_indexed_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    if mx.default_device() != mx.gpu:
+        pytest.skip("Indexed attention requires the native GPU device")
+    arguments = copy.deepcopy(cast(dict[str, Any], MODEL_CONFIGS["glm5_next"]["args"]))
+    text_config = cast(dict[str, Any], arguments["text_config"])
+    configuration = ModelArgs.from_dict(arguments).text_config
+    layer_index = cast(list[str], text_config["layer_types"]).index(
+        "deepseek_sparse_attention"
+    )
+    attention = cast(
+        nn.Module,
+        vars(native_language)["Glm5NextAttention"](configuration, layer_index),
+    )
+    attention_forward = cast(
+        Callable[[mx.array], tuple[mx.array, mx.array]], cast(object, attention)
+    )
+    attention.apply(lambda parameter: parameter.astype(mx.bfloat16))
+    for projection_name in ("qkv_a_proj", "q_b_proj", "o_proj"):
+        projection = cast(nn.Linear, getattr(attention, projection_name))
+        projection.weight = projection.weight.astype(mx.float16)
+        setattr(
+            attention,
+            projection_name,
+            nn.QuantizedLinear.from_linear(
+                projection, group_size=cast(int, text_config["q_lora_rank"]), bits=4
+            ),
+        )
+    original_kernel = cast(
+        Callable[[mx.array, mx.array, mx.array, mx.array, float], mx.array | None],
+        vars(native_language)["indexed_sparse_attention"],
+    )
+    observed: list[tuple[mx.Dtype, bool]] = []
+
+    def record_kernel(
+        queries: mx.array,
+        keys: mx.array,
+        values: mx.array,
+        indices: mx.array,
+        scale: float,
+    ) -> mx.array | None:
+        result = original_kernel(queries, keys, values, indices, scale)
+        observed.append((queries.dtype, result is not None))
+        return result
+
+    def fallback_only(
+        queries: mx.array,
+        keys: mx.array,
+        values: mx.array,
+        indices: mx.array,
+        scale: float,
+    ) -> None:
+        return None
+
+    mx.random.seed(42)
+    inputs = mx.random.normal((1, 16, cast(int, text_config["hidden_size"]))).astype(
+        mx.bfloat16
+    )
+    with monkeypatch.context() as native_patch:
+        native_patch.setitem(
+            vars(native_language), "indexed_sparse_attention", record_kernel
+        )
+        actual, actual_indices = attention_forward(inputs)
+        mx.eval(actual, actual_indices)
+        assert observed == [(mx.float32, True)]
+        native_patch.setitem(
+            vars(native_language), "indexed_sparse_attention", fallback_only
+        )
+        expected, expected_indices = attention_forward(inputs)
+        mx.eval(expected, expected_indices)
+    assert actual.dtype == expected.dtype == mx.float32
+    assert actual.shape == expected.shape == inputs.shape
+    assert mx.all(mx.isfinite(actual)).item()
+    assert mx.array_equal(actual_indices, expected_indices).item()
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+
+
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
 def test_flash_sparse_prefill_fallback_bounds_tile_memory(dtype: mx.Dtype):
     if mx.default_device() != mx.gpu:

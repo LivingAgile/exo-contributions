@@ -65,6 +65,12 @@ let
             test "$(grep -Fxc '            out.reshape(batch, chunk_length, heads, v.shape[-1]).transpose(0, 2, 1, 3)' "$sparsePrefillSource")" -eq 1
             substituteInPlace "$sparsePrefillSource" \
               --replace-fail "$sparsePrefillAppend" $'        mx.eval(out)\n'"$sparsePrefillAppend"
+            local indexedAttentionSource=$out/${final.python.sitePackages}/mlx_vlm/models/sparse_attention.py
+            test "$(grep -Fxc '        or queries.dtype not in (mx.bfloat16, mx.float16)' "$indexedAttentionSource")" -eq 1
+            test "$(grep -Fxc '    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")' "$indexedAttentionSource")" -eq 1
+            substituteInPlace "$indexedAttentionSource" \
+              --replace-fail 'queries.dtype not in (mx.bfloat16, mx.float16)' 'queries.dtype not in (mx.bfloat16, mx.float16, mx.float32)' \
+              --replace-fail '{mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")' '{mx.bfloat16: "bf16", mx.float16: "fp16", mx.float32: "fp32"}.get(dtype, "unk")'
             install -Dm644 ${../nix/muse-glimmer/mlx_vlm/models/activations.py} \
               $out/${final.python.sitePackages}/mlx_vlm/models/activations.py
             install -Dm644 ${../nix/muse-glimmer/mlx_vlm/models/rope_utils.py} \
