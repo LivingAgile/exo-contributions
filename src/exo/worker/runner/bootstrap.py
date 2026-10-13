@@ -58,6 +58,14 @@ def entrypoint(
 
     logger.info(f"Fast synch flag: {os.environ['MLX_METAL_FAST_SYNCH']}")
 
+    # Larger Metal command buffers; MLX reads these once when its device starts.
+    _ = os.environ.setdefault("MLX_MAX_MB_PER_BUFFER", "2048")
+    _ = os.environ.setdefault("MLX_MAX_OPS_PER_BUFFER", "100000")
+    logger.info(
+        f"Metal command buffer limits: {os.environ['MLX_MAX_MB_PER_BUFFER']} MB, "
+        f"{os.environ['MLX_MAX_OPS_PER_BUFFER']} ops"
+    )
+
     # Import main after setting global logger - this lets us just import logger from this module
     try:
         event_sender_downcast: MpSender[Event] = cast(MpSender[Event], event_sender)

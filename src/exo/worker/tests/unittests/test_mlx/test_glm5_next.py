@@ -491,13 +491,14 @@ def test_flash_production_generation_prefix_reuse(monkeypatch: pytest.MonkeyPatc
             model=model,
             tokenizer=tokenizer,
             task=task,
-            prompt=" ".join(["one"] * 600),
+            prompt=" ".join(["one"] * 4200),
             kv_prefix_cache=None,
             group=None,
             on_prefill_progress=observe_progress,
         )
     )
-    assert 512 in progress
+    assert 4096 in progress
+    assert 512 not in progress
     assert len(snapshot_references) > 2
     assert all(reference() is None for reference in snapshot_references)
     prefix = KVPrefixCache(None)
