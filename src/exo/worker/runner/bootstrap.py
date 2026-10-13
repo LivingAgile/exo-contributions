@@ -37,6 +37,13 @@ class RunnerTerminationError:
         return f"{self.exception_type}: {self.exception_message}\n{self.traceback}"
 
 
+def metal_buffer_defaults(model_type: str | None) -> dict[str, str]:
+    """Larger Metal command buffers, applied only to GLM Flash (glm5_next)."""
+    if model_type != "glm5_next":
+        return {}
+    return {"MLX_MAX_MB_PER_BUFFER": "2048", "MLX_MAX_OPS_PER_BUFFER": "100000"}
+
+
 def entrypoint(
     bound_instance: BoundInstance,
     event_sender: MpSender[Event | RunnerTerminationError],
@@ -58,13 +65,13 @@ def entrypoint(
 
     logger.info(f"Fast synch flag: {os.environ['MLX_METAL_FAST_SYNCH']}")
 
-    # Larger Metal command buffers; MLX reads these once when its device starts.
-    _ = os.environ.setdefault("MLX_MAX_MB_PER_BUFFER", "2048")
-    _ = os.environ.setdefault("MLX_MAX_OPS_PER_BUFFER", "100000")
-    logger.info(
-        f"Metal command buffer limits: {os.environ['MLX_MAX_MB_PER_BUFFER']} MB, "
-        f"{os.environ['MLX_MAX_OPS_PER_BUFFER']} ops"
-    )
+    # MLX reads these once when its device starts, so they must be set here.
+    vision = bound_instance.bound_shard.model_card.vision
+    for key, value in metal_buffer_defaults(
+        vision.model_type if vision is not None else None
+    ).items():
+        _ = os.environ.setdefault(key, value)
+        logger.info(f"Metal command buffer default {key}={os.environ[key]}")
 
     # Import main after setting global logger - this lets us just import logger from this module
     try:

@@ -554,3 +554,14 @@ def test_flash_production_generation_prefix_reuse(monkeypatch: pytest.MonkeyPatc
                 for entry in checkpoint.states:
                     if isinstance(entry, VlmCacheList):
                         assert cast(VlmKVCache, list(entry)[-1]).size() == 0
+
+
+def test_metal_buffer_defaults_apply_only_to_glm5_next() -> None:
+    from exo.worker.runner.bootstrap import metal_buffer_defaults
+
+    assert metal_buffer_defaults("glm5_next") == {
+        "MLX_MAX_MB_PER_BUFFER": "2048",
+        "MLX_MAX_OPS_PER_BUFFER": "100000",
+    }
+    for other in (None, "", "gemma4", "qwen3_5", "qwen3_5_moe", "qwen3_next"):
+        assert metal_buffer_defaults(other) == {}
