@@ -576,6 +576,111 @@ def _build_three_node_rdma_topology() -> tuple[
     return topology, node_a, node_b, node_c, node_network
 
 
+def _full_mesh_socket_topology(node_count: int) -> tuple[Topology, list[NodeId]]:
+    topology = Topology()
+    node_ids = [NodeId() for _ in range(node_count)]
+    for node_id in node_ids:
+        topology.add_node(node_id)
+    for source in node_ids:
+        for sink in node_ids:
+            if source != sink:
+                topology.add_connection(
+                    Connection(
+                        source=source, sink=sink, edge=create_socket_connection(1)
+                    )
+                )
+    return topology, node_ids
+
+
+def _card_with_model_type(model_type: str | None) -> ModelCard:
+    return ModelCard(
+        model_id=ModelId(f"test/{model_type or 'plain'}"),
+        storage_size=Memory.from_bytes(1000),
+        n_layers=12,
+        hidden_size=2560,
+        supports_tensor=True,
+        tasks=[ModelTask.TextGeneration],
+        backends=[Backend.MlxMetal],
+        vision=None
+        if model_type is None
+        else VisionCardConfig(
+            image_token_id=0, model_type=model_type, weights_repo="test/weights"
+        ),
+    )
+
+
+def _pipeline_command(model_card: ModelCard, min_nodes: int) -> PlaceInstance:
+    return PlaceInstance(
+        command_id=CommandId(),
+        model_card=model_card,
+        sharding=Sharding.Pipeline,
+        instance_meta=InstanceMeta.MlxRing,
+        min_nodes=min_nodes,
+    )
+
+
+@pytest.mark.parametrize("model_type", ["qwen4_exp", "glm5_next"])
+def test_multi_node_pipeline_refused_for_qwen4_exp_and_glm5_next(
+    model_type: str,
+) -> None:
+    topology, node_ids = _full_mesh_socket_topology(4)
+    node_memory = {node_id: create_node_memory(1000) for node_id in node_ids}
+    node_network = {node_id: create_node_network() for node_id in node_ids}
+
+    with pytest.raises(ValueError, match="use Tensor"):
+        place_instance(
+            _pipeline_command(_card_with_model_type(model_type), min_nodes=2),
+            topology,
+            {},
+            node_memory,
+            node_network,
+            _metal_only(node_memory),
+        )
+
+
+@pytest.mark.parametrize("model_type", ["qwen4_exp", "glm5_next"])
+def test_single_node_pipeline_still_places_for_qwen4_exp_and_glm5_next(
+    model_type: str,
+) -> None:
+    topology, node_ids = _full_mesh_socket_topology(1)
+    node_memory = {node_ids[0]: create_node_memory(1000)}
+    node_network = {node_ids[0]: create_node_network()}
+
+    placements = place_instance(
+        _pipeline_command(_card_with_model_type(model_type), min_nodes=1),
+        topology,
+        {},
+        node_memory,
+        node_network,
+        _metal_only(node_memory),
+    )
+
+    instance = next(iter(placements.values()))
+    assert isinstance(instance, MlxRingInstance)
+    assert len(instance.shard_assignments.node_to_runner) == 1
+
+
+@pytest.mark.parametrize("model_type", [None, "qwen3_5_moe", "gemma3"])
+def test_multi_node_pipeline_still_places_for_unaffected_models(
+    model_type: str | None,
+) -> None:
+    topology, node_ids = _full_mesh_socket_topology(4)
+    node_memory = {node_id: create_node_memory(1000) for node_id in node_ids}
+    node_network = {node_id: create_node_network() for node_id in node_ids}
+
+    placements = place_instance(
+        _pipeline_command(_card_with_model_type(model_type), min_nodes=2),
+        topology,
+        {},
+        node_memory,
+        node_network,
+        _metal_only(node_memory),
+    )
+
+    instance = next(iter(placements.values()))
+    assert len(instance.shard_assignments.node_to_runner) >= 2
+
+
 def test_place_qwen4_exp_tensor_with_fewer_kv_heads_than_nodes() -> None:
     topology = Topology()
     node_ids = [NodeId() for _ in range(4)]

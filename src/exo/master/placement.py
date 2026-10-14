@@ -183,6 +183,25 @@ def place_instance(
             raise ValueError(
                 "Pipeline parallelism is not supported for Gemma 4; use tensor parallelism instead."
             )
+    pipeline_model_type = (
+        command.model_card.vision.model_type
+        if command.model_card.vision is not None
+        else None
+    )
+    if command.sharding == Sharding.Pipeline and pipeline_model_type in (
+        "qwen4_exp",
+        "glm5_next",
+    ):
+        # Multi-node Pipeline fails during warmup for these models; keep the
+        # single-node placement, which is always forced to Pipeline below.
+        cycles_with_sufficient_memory = [
+            cycle for cycle in cycles_with_sufficient_memory if len(cycle) == 1
+        ]
+        if not cycles_with_sufficient_memory:
+            raise ValueError(
+                f"Multi-node Pipeline parallelism is not supported for {pipeline_model_type} "
+                f"({command.model_card.model_id}); use Tensor sharding instead."
+            )
 
     smallest_cycles = get_smallest_cycles(cycles_with_sufficient_memory)
 

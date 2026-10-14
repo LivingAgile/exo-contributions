@@ -38,8 +38,9 @@ class RunnerTerminationError:
 
 
 def metal_buffer_defaults(model_type: str | None) -> dict[str, str]:
-    """Larger Metal command buffers, applied only to GLM Flash (glm5_next)."""
-    if model_type != "glm5_next":
+    """Larger Metal command buffers, applied only to GLM Flash (glm5_next) and
+    Qwen 3.8 Flash Next (qwen4_exp)."""
+    if model_type not in ("glm5_next", "qwen4_exp"):
         return {}
     return {"MLX_MAX_MB_PER_BUFFER": "2048", "MLX_MAX_OPS_PER_BUFFER": "100000"}
 
