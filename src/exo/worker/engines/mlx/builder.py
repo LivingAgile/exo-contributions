@@ -22,6 +22,7 @@ from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
 
 from .cache import KVPrefixCache
 from .glm5_next import Model as FlashModel
+from .qwen4_exp_mtp import maybe_attach_qwen4_exp_mtp
 from .types import Model
 from .utils_mlx import (
     initialize_mlx,
@@ -65,6 +66,8 @@ class MlxBuilder(Builder):
         assert self.tokenizer
 
         vision_processor = self.vision_processor
+        # MTP decoding runs on the sequential path only.
+        mtp = maybe_attach_qwen4_exp_mtp(self.inference_model)
 
         tool_parser = None
         logger.info(
@@ -84,8 +87,10 @@ class MlxBuilder(Builder):
         kv_prefix_cache = KVPrefixCache(self.group)
 
         device_rank = 0 if self.group is None else self.group.rank()
-        if os.environ.get("EXO_NO_BATCH") or isinstance(
-            self.inference_model, FlashModel
+        if (
+            os.environ.get("EXO_NO_BATCH")
+            or isinstance(self.inference_model, FlashModel)
+            or mtp is not None
         ):
             logger.info("using SequentialGenerator (batching disabled)")
             return SequentialGenerator(
