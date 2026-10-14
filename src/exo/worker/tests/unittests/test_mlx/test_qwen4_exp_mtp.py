@@ -44,9 +44,22 @@ def _text_config() -> dict[str, Any]:
     return copy.deepcopy(cast(dict[str, Any], args["text_config"]))
 
 
-def _target(seed: int = 7) -> qwen4_exp.Model:
+# Flash Next's real attention head shape. The fused attention kernel gives
+# different bits for several query rows per call than for one at this shape,
+# but not at the tiny default shape. The indexer head grows with it so that it
+# still holds the rotary dimensions.
+REAL_HEADS = {
+    "num_attention_heads": 24,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "indexer_head_dim": 128,
+}
+
+
+def _target(seed: int = 7, **text_overrides: Any) -> qwen4_exp.Model:
     mx.random.seed(seed)
     args = copy.deepcopy(cast(dict[str, Any], MODEL_CONFIGS["qwen4_exp"]["args"]))
+    args["text_config"].update(text_overrides)
     model = qwen4_exp.Model(qwen4_exp.ModelArgs(**args))
     mx.eval(model.parameters())
     return model
@@ -335,9 +348,9 @@ def test_incompatible_drafter_is_refused() -> None:
     assert get_qwen4_exp_mtp(model) is None
 
 
-def _served_like_target(seed: int) -> qwen4_exp.Model:
+def _served_like_target(seed: int, **text_overrides: Any) -> qwen4_exp.Model:
     """bf16 weights with 8-bit quantized projections, like the served checkpoint."""
-    model = _target(seed)
+    model = _target(seed, **text_overrides)
     model.update(
         tree_map(
             lambda p: p.astype(mx.bfloat16)
@@ -357,12 +370,18 @@ def _served_like_target(seed: int) -> qwen4_exp.Model:
     return model
 
 
-@pytest.mark.parametrize("seed", [7, 11])
-def test_mtp_logprobs_are_bit_identical_to_plain(seed: int) -> None:
+@pytest.mark.parametrize(
+    ("seed", "heads"),
+    [(7, {}), (11, {}), (7, REAL_HEADS)],
+    ids=["seed7", "seed11", "real-heads"],
+)
+def test_mtp_logprobs_are_bit_identical_to_plain(
+    seed: int, heads: dict[str, int]
+) -> None:
     # Plain decode scores one token per forward pass; MTP scores a block of
     # tokens per pass. Every emitted logprob row must still match bit for bit,
     # otherwise sampled and reasoning output drifts from plain decoding.
-    model = _served_like_target(seed)
+    model = _served_like_target(seed, **heads)
     tokenizer = _tokenizer()
     cache = model.make_cache()
     prompt = mx.array(PROMPT)
@@ -381,8 +400,19 @@ def test_mtp_logprobs_are_bit_identical_to_plain(seed: int) -> None:
     )
     reference = [r.token for r in plain]
 
-    model = _served_like_target(seed)
-    drafter = OracleDrafter(_drafter_config(), reference, [-1, 1, -1, 0])
+    model = _served_like_target(seed, **heads)
+    drafter = OracleDrafter(_drafter_config(**heads), reference, [-1, 1, -1, 0])
+    if heads:
+        # Like the served drafter. Metal has no float32 attention kernel at
+        # head size 256.
+        drafter.update(
+            tree_map(
+                lambda p: p.astype(mx.bfloat16)
+                if mx.issubdtype(p.dtype, mx.floating)
+                else p,
+                drafter.parameters(),
+            )
+        )
     state = _attach(model, drafter)
     state.configured_block_size = 4
     cache = model.make_cache()
@@ -410,6 +440,39 @@ def test_mtp_logprobs_are_bit_identical_to_plain(seed: int) -> None:
     assert sum(state.accept_lens) > 0
     for want, have in zip(plain, got, strict=True):
         assert mx.array_equal(want.logprobs, have.logprobs).item()
+
+
+@pytest.mark.parametrize("kv_len", [256, 1500])
+def test_verify_attention_matches_one_row_decode_at_real_heads(kv_len: int) -> None:
+    # Each verify row must give the same bits as a one-token decode step that
+    # sees only the keys up to its own position.
+    _attach(_target(), Qwen4ExpMTPDraftModel(_drafter_config()))
+    rows, h, kvh, d = 5, 24, 2, 256
+    mx.random.seed(1)
+    q = mx.random.normal((1, h, rows, d)).astype(mx.bfloat16)
+    k = mx.random.normal((1, kvh, kv_len, d)).astype(mx.bfloat16)
+    v = mx.random.normal((1, kvh, kv_len, d)).astype(mx.bfloat16)
+    causal = mx.arange(kv_len - rows, kv_len)[:, None] >= mx.arange(kv_len)
+    keep = causal & (mx.random.uniform(shape=(1, 1, rows, kv_len)) > 0.3)
+    for mask in ("causal", keep):
+        token = mtp_module._stepwise_recurrence.set(True)
+        try:
+            block = qwen4_exp.scaled_dot_product_attention(
+                q, k, v, cache=None, scale=d**-0.5, mask=mask
+            )
+        finally:
+            mtp_module._stepwise_recurrence.reset(token)
+        for t in range(rows):
+            end = kv_len - rows + t + 1
+            row_mask = None if isinstance(mask, str) else mask[..., t : t + 1, :end]
+            want = mx.fast.scaled_dot_product_attention(
+                q[:, :, t : t + 1],
+                k[:, :, :end],
+                v[:, :, :end],
+                scale=d**-0.5,
+                mask=row_mask,
+            )
+            assert mx.array_equal(block[:, :, t : t + 1], want).item()
 
 
 def test_attach_requires_env_and_qwen4_exp(monkeypatch: pytest.MonkeyPatch) -> None:
