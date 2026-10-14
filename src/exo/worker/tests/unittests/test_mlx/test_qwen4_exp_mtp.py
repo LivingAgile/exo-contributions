@@ -3,7 +3,9 @@ import copy
 from typing import Any, cast
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
+from mlx.utils import tree_map
 from mlx_lm.generate import stream_generate
 from mlx_lm.models import qwen4_exp
 from mlx_lm.models.cache import ArraysCache
@@ -331,6 +333,83 @@ def test_incompatible_drafter_is_refused() -> None:
     drafter = Qwen4ExpMTPDraftModel(_drafter_config(rms_norm_eps=1e-5))
     assert attach_qwen4_exp_mtp(model, drafter) is None
     assert get_qwen4_exp_mtp(model) is None
+
+
+def _served_like_target(seed: int) -> qwen4_exp.Model:
+    """bf16 weights with 8-bit quantized projections, like the served checkpoint."""
+    model = _target(seed)
+    model.update(
+        tree_map(
+            lambda p: p.astype(mx.bfloat16)
+            if mx.issubdtype(p.dtype, mx.floating)
+            else p,
+            model.parameters(),
+        )
+    )
+    nn.quantize(
+        model,
+        group_size=32,
+        bits=8,
+        class_predicate=lambda _p, m: hasattr(m, "to_quantized")
+        and m.weight.shape[-1] % 32 == 0,
+    )
+    mx.eval(model.parameters())
+    return model
+
+
+@pytest.mark.parametrize("seed", [7, 11])
+def test_mtp_logprobs_are_bit_identical_to_plain(seed: int) -> None:
+    # Plain decode scores one token per forward pass; MTP scores a block of
+    # tokens per pass. Every emitted logprob row must still match bit for bit,
+    # otherwise sampled and reasoning output drifts from plain decoding.
+    model = _served_like_target(seed)
+    tokenizer = _tokenizer()
+    cache = model.make_cache()
+    prompt = mx.array(PROMPT)
+    model(prompt[None, :-2], cache=cache)
+    mx.eval([c.state for c in cache])
+    plain = list(
+        stream_generate(
+            model,
+            tokenizer,
+            prompt[-2:],
+            max_tokens=24,
+            sampler=_greedy,
+            prompt_cache=cache,
+            prefill_step_size=1,
+        )
+    )
+    reference = [r.token for r in plain]
+
+    model = _served_like_target(seed)
+    drafter = OracleDrafter(_drafter_config(), reference, [-1, 1, -1, 0])
+    state = _attach(model, drafter)
+    state.configured_block_size = 4
+    cache = model.make_cache()
+    state.capture.begin_prefill()
+    model(prompt[None, :-2], cache=cache)
+    tail = state.capture.tail
+    state.capture.mode = "off"
+    mx.eval([c.state for c in cache])
+    got = list(
+        mtp_stream_generate(
+            model,
+            tokenizer,
+            prompt[-2:],
+            state,
+            max_tokens=24,
+            sampler=_greedy,
+            logits_processors=None,
+            prompt_cache=cache,
+            context_tokens=prompt,
+            prefill_hidden=tail,
+        )
+    )
+
+    assert [r.token for r in got] == reference
+    assert sum(state.accept_lens) > 0
+    for want, have in zip(plain, got, strict=True):
+        assert mx.array_equal(want.logprobs, have.logprobs).item()
 
 
 def test_attach_requires_env_and_qwen4_exp(monkeypatch: pytest.MonkeyPatch) -> None:

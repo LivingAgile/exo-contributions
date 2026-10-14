@@ -15,12 +15,14 @@ on the sequential (non-batched, non-pipeline) generation path.
 import os
 import time
 from collections.abc import Callable, Collection, Generator, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Protocol, cast
 
 import mlx.core as mx
 from mlx import nn
 from mlx_lm.generate import GenerationResponse, generation_stream, wired_limit
+from mlx_lm.models import qwen4_exp as qwen4_exp_module
 from mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_lm.models.qwen4_exp import Model as Qwen4ExpModel
 from mlx_lm.tokenizer_utils import StreamingDetokenizer, TokenizerWrapper
@@ -45,6 +47,59 @@ _COMPAT_FIELDS = (
 )
 
 LogitsProcessor = Callable[[mx.array, mx.array], mx.array]
+
+# The linear-attention recurrence kernel gives slightly different bits when it
+# processes several positions in one call than when it processes them one at a
+# time. Plain decoding feeds one token per call, so the MTP verify and replay
+# passes run the recurrence one position at a time to match it bit for bit.
+# Every other layer of the model already gives identical bits either way.
+_stepwise_recurrence: ContextVar[bool] = ContextVar(
+    "exo_qwen4_exp_mtp_stepwise", default=False
+)
+_GatedDeltaUpdate = Callable[..., tuple[mx.array, mx.array]]
+_STEPWISE_MARK = "_exo_mtp_stepwise"
+
+
+def _install_stepwise_recurrence() -> None:
+    base = cast(_GatedDeltaUpdate, qwen4_exp_module.gated_delta_update)
+    if getattr(base, _STEPWISE_MARK, False):
+        return
+
+    def gated_delta_update(
+        q: mx.array,
+        k: mx.array,
+        v: mx.array,
+        a: mx.array,
+        b: mx.array,
+        A_log: mx.array,  # noqa: N803 - mlx_lm's parameter name
+        dt_bias: mx.array,
+        state: mx.array | None = None,
+        mask: mx.array | None = None,
+        use_kernel: bool = True,
+    ) -> tuple[mx.array, mx.array]:
+        steps = q.shape[1]
+        if steps == 1 or not _stepwise_recurrence.get():
+            return base(q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel)
+        outputs: list[mx.array] = []
+        for t in range(steps):
+            y, state = base(
+                q[:, t : t + 1],
+                k[:, t : t + 1],
+                v[:, t : t + 1],
+                a[:, t : t + 1],
+                b[:, t : t + 1],
+                A_log,
+                dt_bias,
+                state,
+                None if mask is None else mask[:, t : t + 1],
+                use_kernel,
+            )
+            outputs.append(y)
+        assert state is not None
+        return mx.concatenate(outputs, axis=1), state
+
+    setattr(gated_delta_update, _STEPWISE_MARK, True)
+    setattr(qwen4_exp_module, "gated_delta_update", gated_delta_update)  # noqa: B010
 
 
 class Drafter(Protocol):
@@ -217,6 +272,7 @@ def attach_qwen4_exp_mtp(model: object, drafter: Drafter) -> Qwen4ExpMTPState | 
     inner = cast(nn.Module, getattr(model, "model"))  # noqa: B009 - untyped mlx_lm model
     mixer = cast(nn.Module, getattr(inner, "hyper_connection_mixer"))  # noqa: B009
     _install_capture(mixer, capture)
+    _install_stepwise_recurrence()
     drafter.bind(model)
     block_size: int = getattr(drafter.config, "block_size", 2)
     state = Qwen4ExpMTPState(
@@ -340,7 +396,11 @@ def _mtp_generate_step(
     history: mx.array | None = None
 
     def forward(tokens: mx.array) -> tuple[mx.array, mx.array]:
-        logits = model(tokens[None], cache=prompt_cache)
+        stepwise = _stepwise_recurrence.set(True)
+        try:
+            logits = model(tokens[None], cache=prompt_cache)
+        finally:
+            _stepwise_recurrence.reset(stepwise)
         assert capture.last is not None
         return logits, capture.last
 
