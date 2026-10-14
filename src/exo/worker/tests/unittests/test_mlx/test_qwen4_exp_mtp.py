@@ -488,8 +488,10 @@ def test_verify_unquantized_linear_matches_one_row_decode_at_real_size(
     suffix: str, out_dims: int, in_dtype: mx.Dtype
 ) -> None:
     # The served checkpoint leaves these layers unquantized in bf16. At the real
-    # hidden size a five-row matrix multiply gives different bits than five
-    # one-row calls, and the router turns that into different experts.
+    # size a five-row router matrix multiply gives different bits than five
+    # one-row calls, and the router turns that into different experts. With
+    # random weights only the router case reproduces the difference; the other
+    # two (seen on real weights) are guards.
     model = _target()
     _attach(model, Qwen4ExpMTPDraftModel(_drafter_config()))
     layer = next(m for n, m in model.named_modules() if n.endswith(suffix))

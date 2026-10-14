@@ -173,7 +173,11 @@ class _StepwiseLinear(nn.Linear):
 
 
 def _install_stepwise_linear(model: nn.Module) -> None:
-    for _, module in model.named_modules():
+    modules = cast(
+        list[tuple[str, nn.Module]],
+        model.named_modules(),  # pyright: ignore[reportUnknownMemberType]
+    )
+    for _, module in modules:
         if type(module) is nn.Linear:
             module.__class__ = _StepwiseLinear
 
