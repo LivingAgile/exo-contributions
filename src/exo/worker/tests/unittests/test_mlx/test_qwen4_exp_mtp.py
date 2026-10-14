@@ -475,6 +475,37 @@ def test_verify_attention_matches_one_row_decode_at_real_heads(kv_len: int) -> N
             assert mx.array_equal(block[:, :, t : t + 1], want).item()
 
 
+@pytest.mark.parametrize(
+    ("suffix", "out_dims", "in_dtype"),
+    [
+        ("mlp.gate", 512, mx.float32),
+        ("mlp.shared_expert_gate", 1, mx.bfloat16),
+        ("linear_attn.in_proj_a", 48, mx.bfloat16),
+    ],
+    ids=["router", "shared-gate", "linear-attn-a"],
+)
+def test_verify_unquantized_linear_matches_one_row_decode_at_real_size(
+    suffix: str, out_dims: int, in_dtype: mx.Dtype
+) -> None:
+    # The served checkpoint leaves these layers unquantized in bf16. At the real
+    # hidden size a five-row matrix multiply gives different bits than five
+    # one-row calls, and the router turns that into different experts.
+    model = _target()
+    _attach(model, Qwen4ExpMTPDraftModel(_drafter_config()))
+    layer = next(m for n, m in model.named_modules() if n.endswith(suffix))
+    mx.random.seed(5)
+    layer.weight = (0.02 * mx.random.normal((out_dims, 2560))).astype(mx.bfloat16)
+    x = mx.random.normal((1, 5, 2560)).astype(mx.bfloat16).astype(in_dtype)
+    token = mtp_module._stepwise_recurrence.set(True)
+    try:
+        block = layer(x)
+    finally:
+        mtp_module._stepwise_recurrence.reset(token)
+    for t in range(5):
+        want = x[:, t : t + 1] @ layer.weight.T
+        assert mx.array_equal(block[:, t : t + 1], want).item()
+
+
 def test_attach_requires_env_and_qwen4_exp(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _target()
     loaded: list[str] = []

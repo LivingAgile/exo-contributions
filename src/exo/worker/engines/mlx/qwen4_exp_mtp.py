@@ -52,8 +52,9 @@ LogitsProcessor = Callable[[mx.array, mx.array], mx.array]
 # processes several positions in one call than when it processes them one at a
 # time. Plain decoding feeds one token per call, so the MTP verify and replay
 # passes run the recurrence one position at a time to match it bit for bit.
-# Attention needs the same treatment (below); the projections, MoE and norms
-# already give identical bits either way.
+# Attention and the unquantized linear layers need the same treatment (below);
+# the quantized projections, the experts and the norms already give identical
+# bits either way.
 _stepwise_recurrence: ContextVar[bool] = ContextVar(
     "exo_qwen4_exp_mtp_stepwise", default=False
 )
@@ -152,6 +153,29 @@ def _install_stepwise_attention() -> None:
     setattr(  # noqa: B010
         qwen4_exp_module, "scaled_dot_product_attention", scaled_dot_product_attention
     )
+
+
+# The checkpoint leaves several small linear layers unquantized (the MoE router
+# and shared-expert gate, the linear-attention a/b projections and the indexer
+# projection). A bf16 matrix multiply over several rows gives slightly
+# different bits than one row at a time, and the router's choice of experts
+# then amplifies the difference. During the verify and replay passes those
+# layers run one row at a time.
+class _StepwiseLinear(nn.Linear):
+    def __call__(self, x: mx.array) -> mx.array:
+        rows = x.shape[-2] if x.ndim >= 3 else 1
+        if rows == 1 or not _stepwise_recurrence.get():
+            return nn.Linear.__call__(self, x)
+        return mx.concatenate(
+            [nn.Linear.__call__(self, x[..., t : t + 1, :]) for t in range(rows)],
+            axis=-2,
+        )
+
+
+def _install_stepwise_linear(model: nn.Module) -> None:
+    for _, module in model.named_modules():
+        if type(module) is nn.Linear:
+            module.__class__ = _StepwiseLinear
 
 
 class Drafter(Protocol):
@@ -326,6 +350,7 @@ def attach_qwen4_exp_mtp(model: object, drafter: Drafter) -> Qwen4ExpMTPState | 
     _install_capture(mixer, capture)
     _install_stepwise_recurrence()
     _install_stepwise_attention()
+    _install_stepwise_linear(model)
     drafter.bind(model)
     block_size: int = getattr(drafter.config, "block_size", 2)
     state = Qwen4ExpMTPState(
