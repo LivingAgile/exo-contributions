@@ -162,6 +162,33 @@ def test_a_new_prompt_evicts_from_the_least_recently_used_end() -> None:
     assert at_prefill["first_tokens"] == [10, 20], at_prefill
 
 
+def test_a_measured_prefill_peak_raises_the_estimate_for_later_prefills(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Prefill temporaries can cost far more per token than the KV cache they produce (Qwen3.8
+    # Flash Next: about seven times as much); an estimate from KV bytes alone lets the crash through.
+    model, tokenizer = _model(), _tokenizer()
+    prefix_cache = KVPrefixCache(None)
+    entry = _history(model, tokenizer, prefix_cache)
+    monkeypatch.setattr(
+        cache_module, "_PREFILL_SAMPLE_MIN_TOKENS", PROMPT_TOKENS, raising=False
+    )
+    # A 64-token prefill that peaks three entries' worth above where it started.
+    peak = patch.object(mx, "get_peak_memory",
+                        lambda: WEIGHTS + _cached_bytes(prefix_cache) + 3 * entry)
+    active, cached, info = _faked_memory(prefix_cache, WEIGHTS + 1000 * entry)
+    with active, cached, info, peak:
+        _serve(model, tokenizer, prefix_cache, _prompt(40))
+
+    # KV bytes alone say a 64-token prompt needs one entry: four held plus one fits in five and
+    # a half. The measured peak says three, so only two entries may stay.
+    active, cached, info = _faked_memory(prefix_cache, WEIGHTS + int(5.5 * entry))
+    with active, cached, info:
+        at_prefill = _serve(model, tokenizer, prefix_cache, _prompt(77))
+
+    assert at_prefill["first_tokens"] == [20, 40], at_prefill
+
+
 # -- Rank agreement: two real ranks on a localhost ring, each with its own GPU reading. --
 
 

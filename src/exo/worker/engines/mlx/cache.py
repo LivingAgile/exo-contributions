@@ -69,6 +69,13 @@ _PREFILL_RESERVE_BYTES = int(
 # The GPU memory budget for weights, the prefix cache and a prefill. Defaults to the device's
 # recommended working set; 0 disables the check.
 _GPU_BUDGET_BYTES = int(os.environ.get("EXO_PREFILL_GPU_BUDGET_BYTES", "-1"))
+# A prefill's temporaries grow with the context it attends over, and for some models (Qwen3.8
+# Flash Next: ~330 KB per token) far faster than its KV cache does. The cache measures each
+# prefill's peak and estimates the next from the largest per-token cost seen. Short prefills are
+# not measured: their fixed costs, which the reserve covers, would dominate the per-token figure.
+_PREFILL_SAMPLE_MIN_TOKENS = int(
+    os.environ.get("EXO_PREFILL_SAMPLE_MIN_TOKENS", "8192")
+)
 
 
 def _gpu_budget_bytes() -> int:
@@ -269,6 +276,10 @@ class KVPrefixCache:
         self.prefill_tps: list[float] = []
         self._access_counter: int = 0
         self._group = group
+        # Largest measured prefill cost per prompt token, above the reserve.
+        self._prefill_bytes_per_token: float = 0.0
+        # (active memory, prompt tokens) when the current prefill began.
+        self._prefill_started: tuple[int, int] | None = None
 
     def clear(self):
         """Clear all cached prompts and caches."""
@@ -289,6 +300,7 @@ class KVPrefixCache:
         prefill_tps: float = 0.0,
     ):
         """Add a new cache entry. Evicts LRU entries if memory is high or the cache is full."""
+        self._record_prefill(len(prompt_tokens))
         entry_bytes = _entry_nbytes(cache, ssm_snapshots)
         self._evict_if_needed(entry_bytes)
         self.prompts.append(prompt_tokens)
@@ -312,6 +324,7 @@ class KVPrefixCache:
         prefill_tps: float = 0.0,
     ):
         """Update an existing cache entry in-place."""
+        self._record_prefill(len(prompt_tokens))
         old_snapshots = self._snapshots[index]
         merged: list[CacheSnapshot] = []
         if old_snapshots:
@@ -499,11 +512,32 @@ class KVPrefixCache:
     ) -> int | None:
         """Evict least recently used entries, other than keep_index, until a prefill of
         prompt_length tokens fits in the GPU budget. Returns keep_index after evictions."""
-        if not self.caches:
-            return keep_index
         budget = _gpu_budget_bytes()
-        if budget <= 0:
-            return keep_index
+        if self.caches and budget > 0:
+            keep_index = self._evict_for_prefill(prompt_length, keep_index, budget)
+        # Measure this prefill's peak from here (see _record_prefill).
+        self._prefill_started = (mx.get_active_memory(), prompt_length)
+        mx.reset_peak_memory()
+        return keep_index
+
+    def _record_prefill(self, prompt_length: int) -> None:
+        started, self._prefill_started = self._prefill_started, None
+        if started is None or started[1] != prompt_length:
+            return
+        if prompt_length < _PREFILL_SAMPLE_MIN_TOKENS:
+            return
+        used = mx.get_peak_memory() - started[0] - _PREFILL_RESERVE_BYTES
+        per_token = used / prompt_length
+        if per_token > self._prefill_bytes_per_token:
+            self._prefill_bytes_per_token = per_token
+            logger.info(
+                f"Prefill memory estimate raised to {per_token / 1024:.0f} KiB per token "
+                f"(a {prompt_length}-token prefill peaked {used / 1024**3:.1f} GiB above the reserve)"
+            )
+
+    def _evict_for_prefill(
+        self, prompt_length: int, keep_index: int | None, budget: int
+    ) -> int | None:
         kept = self.caches[keep_index] if keep_index is not None else None
         evicted: list[int] = []
         while self._prefill_does_not_fit(prompt_length, budget):
@@ -535,7 +569,10 @@ class KVPrefixCache:
 
     def _prefill_does_not_fit(self, prompt_length: int, budget: int) -> bool:
         cached_tokens = sum(len(prompt) for prompt in self.prompts)
-        bytes_per_token = sum(self._entry_bytes) / max(cached_tokens, 1)
+        bytes_per_token = max(
+            sum(self._entry_bytes) / max(cached_tokens, 1),
+            self._prefill_bytes_per_token,
+        )
         need = int(bytes_per_token * prompt_length) + _PREFILL_RESERVE_BYTES
         in_use = mx.get_active_memory() + mx.get_cache_memory()
         if in_use + need > budget:
