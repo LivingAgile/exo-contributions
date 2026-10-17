@@ -80,6 +80,10 @@ _GPU_BUDGET_BYTES = int(os.environ.get("EXO_PREFILL_GPU_BUDGET_BYTES", "-1"))
 _PREFILL_SAMPLE_MIN_TOKENS = int(
     os.environ.get("EXO_PREFILL_SAMPLE_MIN_TOKENS", "8192")
 )
+# Slack kept on top of a measured prefill cost, for a later prefill that peaks a little higher.
+_PREFILL_MARGIN_BYTES = int(
+    os.environ.get("EXO_PREFILL_MARGIN_BYTES", str(4 * 1024**3))
+)
 
 
 def _gpu_budget_bytes() -> int:
@@ -578,13 +582,13 @@ class KVPrefixCache:
             return
         if prompt_length < _PREFILL_SAMPLE_MIN_TOKENS:
             return
-        used = mx.get_peak_memory() - started[0] - _PREFILL_RESERVE_BYTES
+        used = mx.get_peak_memory() - started[0]
         per_token = used / prompt_length
         if per_token > self._prefill_bytes_per_token:
             self._prefill_bytes_per_token = per_token
             logger.info(
                 f"Prefill memory estimate raised to {per_token / 1024:.0f} KiB per token "
-                f"(a {prompt_length}-token prefill peaked {used / 1024**3:.1f} GiB above the reserve)"
+                f"(a {prompt_length}-token prefill peaked {used / 1024**3:.1f} GiB above its start)"
             )
 
     def _evict_for_prefill(
@@ -621,11 +625,11 @@ class KVPrefixCache:
 
     def _prefill_does_not_fit(self, prompt_length: int, budget: int) -> bool:
         cached_tokens = sum(len(prompt) for prompt in self.prompts)
-        bytes_per_token = max(
-            sum(self._entry_bytes) / max(cached_tokens, 1),
-            self._prefill_bytes_per_token,
+        kv_per_token = sum(self._entry_bytes) / max(cached_tokens, 1)
+        need = max(
+            int(kv_per_token * prompt_length) + _PREFILL_RESERVE_BYTES,
+            int(self._prefill_bytes_per_token * prompt_length) + _PREFILL_MARGIN_BYTES,
         )
-        need = int(bytes_per_token * prompt_length) + _PREFILL_RESERVE_BYTES
         in_use = mx.get_active_memory() + mx.get_cache_memory()
         if in_use + need > budget:
             # Freed buffers held by MLX's allocator count as in use until released.

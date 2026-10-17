@@ -96,6 +96,7 @@ def no_reserve_and_no_psutil_pressure(monkeypatch: pytest.MonkeyPatch) -> Iterat
     # The reserve is configuration; zero keeps the arithmetic in KV bytes. psutil pressure is the
     # add-time policy, not what these tests are about.
     monkeypatch.setattr(cache_module, "_PREFILL_RESERVE_BYTES", 0, raising=False)
+    monkeypatch.setattr(cache_module, "_PREFILL_MARGIN_BYTES", 0, raising=False)
     monkeypatch.setattr(cache_module, "_GPU_BUDGET_BYTES", -1, raising=False)
     with patch.object(cache_module, "get_memory_used_percentage", return_value=0.1):
         yield
@@ -189,6 +190,32 @@ def test_a_measured_prefill_peak_raises_the_estimate_for_later_prefills(
     assert at_prefill["first_tokens"] == [20, 40], at_prefill
 
 
+def test_a_measured_prefill_cost_keeps_the_configured_margin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Evicting to exactly the last measured peak leaves nothing for a prefill that peaks a little
+    # higher; Flash Next crashed only about 1 GB past Metal's working set.
+    model, tokenizer = _model(), _tokenizer()
+    prefix_cache = KVPrefixCache(None)
+    entry = _history(model, tokenizer, prefix_cache)
+    monkeypatch.setattr(
+        cache_module, "_PREFILL_SAMPLE_MIN_TOKENS", PROMPT_TOKENS, raising=False
+    )
+    monkeypatch.setattr(cache_module, "_PREFILL_MARGIN_BYTES", entry, raising=False)
+    peak = patch.object(mx, "get_peak_memory",
+                        lambda: WEIGHTS + _cached_bytes(prefix_cache) + 3 * entry)
+    active, cached, info = _faked_memory(prefix_cache, WEIGHTS + 1000 * entry)
+    with active, cached, info, peak:
+        _serve(model, tokenizer, prefix_cache, _prompt(40))
+
+    # Measured three entries plus a one-entry margin: in five and a half, only one may stay.
+    active, cached, info = _faked_memory(prefix_cache, WEIGHTS + int(5.5 * entry))
+    with active, cached, info:
+        at_prefill = _serve(model, tokenizer, prefix_cache, _prompt(77))
+
+    assert at_prefill["first_tokens"] == [40], at_prefill
+
+
 # -- Rank agreement: two real ranks on a localhost ring, each with its own GPU reading. --
 
 
@@ -198,6 +225,7 @@ def _rank(rank: int, hostfile: str, results: Any) -> None:
     try:
         group = mx.distributed.init(backend="ring", strict=True)
         cache_module._PREFILL_RESERVE_BYTES = 0
+        cache_module._PREFILL_MARGIN_BYTES = 0
         cache_module._GPU_BUDGET_BYTES = -1
         cache_module.get_memory_used_percentage = lambda: 0.1
         model, tokenizer = _model(), _tokenizer()
