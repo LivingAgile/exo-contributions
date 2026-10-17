@@ -59,6 +59,23 @@ _MAX_BYTES = int(
     )
 )
 
+# GPU memory a prefill needs on top of its KV cache: activations and temporaries of one prefill
+# chunk. Entries are only evicted when a new one is added, after its prefill, so without a check
+# before prefill a long prompt on top of a full cache can exceed Metal's working set, and Metal
+# aborts the process (kIOGPUCommandBufferCallbackErrorOutOfMemory).
+_PREFILL_RESERVE_BYTES = int(
+    os.environ.get("EXO_PREFILL_RESERVE_BYTES", str(16 * 1024**3))
+)
+# The GPU memory budget for weights, the prefix cache and a prefill. Defaults to the device's
+# recommended working set; 0 disables the check.
+_GPU_BUDGET_BYTES = int(os.environ.get("EXO_PREFILL_GPU_BUDGET_BYTES", "-1"))
+
+
+def _gpu_budget_bytes() -> int:
+    if _GPU_BUDGET_BYTES >= 0:
+        return _GPU_BUDGET_BYTES
+    return int(mx.device_info().get("max_recommended_working_set_size", 0))
+
 
 class CacheSnapshot:
     """Snapshot of states at a known token position."""
@@ -375,6 +392,7 @@ class KVPrefixCache:
                 best_index, best_length = i, length
 
         if best_index is None:
+            self._ensure_prefill_headroom(max_length, keep_index=None)
             return make_kv_cache(model), prompt_tokens, None, False
 
         # For exact match: trim to max_length-1 so remaining has the last token
@@ -391,8 +409,12 @@ class KVPrefixCache:
 
         # No usable snapshot — need fresh cache
         if restore_snap is None and has_ssm:
+            self._ensure_prefill_headroom(max_length, keep_index=None)
             return make_kv_cache(model), prompt_tokens, None, False
 
+        # Make room before the working copy below and the prefill that follows it.
+        best_index = self._ensure_prefill_headroom(max_length, keep_index=best_index)
+        assert best_index is not None
         prompt_cache = deepcopy(self.caches[best_index])
         tokens_to_trim = cached_length - restore_pos
         if tokens_to_trim > 0:
@@ -453,21 +475,81 @@ class KVPrefixCache:
         # Evict LRU entries until below the limits
         while len(self.caches) > 0 and self._over_limit(incoming_bytes):
             lru_index = self._last_used.index(min(self._last_used))
-            evicted_tokens = len(self.prompts[lru_index])
-            self.prompts.pop(lru_index)
-            self.caches.pop(lru_index)
-            self._snapshots.pop(lru_index)
-            self._media_regions.pop(lru_index)
-            self._last_used.pop(lru_index)
-            self._entry_bytes.pop(lru_index)
-            self.prefill_tps.pop(lru_index)
-
+            evicted_tokens = self._pop_entry(lru_index)
             evicted_any = True
             logger.info(f"KV cache evicted LRU entry ({evicted_tokens} tokens)")
 
         if evicted_any:
             gc.collect()
             mx.clear_cache()
+
+    def _pop_entry(self, index: int) -> int:
+        evicted_tokens = len(self.prompts[index])
+        self.prompts.pop(index)
+        self.caches.pop(index)
+        self._snapshots.pop(index)
+        self._media_regions.pop(index)
+        self._last_used.pop(index)
+        self._entry_bytes.pop(index)
+        self.prefill_tps.pop(index)
+        return evicted_tokens
+
+    def _ensure_prefill_headroom(
+        self, prompt_length: int, keep_index: int | None
+    ) -> int | None:
+        """Evict least recently used entries, other than keep_index, until a prefill of
+        prompt_length tokens fits in the GPU budget. Returns keep_index after evictions."""
+        if not self.caches:
+            return keep_index
+        budget = _gpu_budget_bytes()
+        if budget <= 0:
+            return keep_index
+        kept = self.caches[keep_index] if keep_index is not None else None
+        evicted: list[int] = []
+        while self._prefill_does_not_fit(prompt_length, budget):
+            candidates = [
+                i for i in range(len(self.caches)) if self.caches[i] is not kept
+            ]
+            if not candidates:
+                logger.warning(
+                    f"A {prompt_length}-token prefill may not fit in GPU memory even "
+                    "with no other prefix cache entries"
+                )
+                break
+            lru_index = min(candidates, key=lambda i: self._last_used[i])
+            evicted.append(self._pop_entry(lru_index))
+            gc.collect()
+            mx.clear_cache()
+            logger.info(
+                f"KV cache evicted LRU entry ({evicted[-1]} tokens) to make room "
+                f"for a {prompt_length}-token prefill"
+            )
+        if evicted:
+            logger.info(
+                f"KV cache evicted {len(evicted)} entries before prefill; "
+                f"{len(self.caches)} remain"
+            )
+        if kept is None:
+            return None
+        return next(i for i, cache in enumerate(self.caches) if cache is kept)
+
+    def _prefill_does_not_fit(self, prompt_length: int, budget: int) -> bool:
+        cached_tokens = sum(len(prompt) for prompt in self.prompts)
+        bytes_per_token = sum(self._entry_bytes) / max(cached_tokens, 1)
+        need = int(bytes_per_token * prompt_length) + _PREFILL_RESERVE_BYTES
+        in_use = mx.get_active_memory() + mx.get_cache_memory()
+        if in_use + need > budget:
+            # Freed buffers held by MLX's allocator count as in use until released.
+            mx.clear_cache()
+            in_use = mx.get_active_memory() + mx.get_cache_memory()
+        local = in_use + need > budget
+        if self._group is None:
+            return local
+        # Every rank must evict the same entries (see _over_limit): evict while any rank lacks room.
+        flags = mx.distributed.all_gather(
+            mx.array([float(local)], dtype=mx.float32), group=self._group
+        )
+        return cast(float, mx.max(flags).item()) > 0
 
     def _over_limit(self, incoming_bytes: int) -> bool:
         # The same on every rank: they all hold the same entries
