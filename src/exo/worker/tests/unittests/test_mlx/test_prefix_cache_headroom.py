@@ -78,21 +78,34 @@ def _serve(model, tokenizer, prefix_cache: KVPrefixCache, tokens: mx.array) -> d
     cache, remaining, matched, _ = prefix_cache.get_kv_cache(model, tokens)
     at_prefill = {
         "first_tokens": [int(p[0].item()) for p in prefix_cache.prompts],
-        "matched": None if matched is None else int(prefix_cache.prompts[matched][0].item()),
+        "matched": None
+        if matched is None
+        else int(prefix_cache.prompts[matched][0].item()),
         "in_use": mx.get_active_memory(),
     }
-    _, _, snapshots = prefill(model, tokenizer, make_sampler(0.0), remaining, cache,
-                              group=None, on_prefill_progress=None,
-                              distributed_prompt_progress_callback=None)
+    _, _, snapshots = prefill(
+        model,
+        tokenizer,
+        make_sampler(0.0),
+        remaining,
+        cache,
+        group=None,
+        on_prefill_progress=None,
+        distributed_prompt_progress_callback=None,
+    )
     if matched is None:
         prefix_cache.add_kv_cache(tokens, cache, snapshots)
     else:
-        prefix_cache.update_kv_cache(matched, tokens, cache, snapshots, len(tokens) - len(remaining))
+        prefix_cache.update_kv_cache(
+            matched, tokens, cache, snapshots, len(tokens) - len(remaining)
+        )
     return at_prefill
 
 
 @pytest.fixture(autouse=True)
-def no_reserve_and_no_psutil_pressure(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def no_reserve_and_no_psutil_pressure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
     # The reserve is configuration; zero keeps the arithmetic in KV bytes. psutil pressure is the
     # add-time policy, not what these tests are about.
     monkeypatch.setattr(cache_module, "_PREFILL_RESERVE_BYTES", 0, raising=False)
@@ -114,9 +127,13 @@ def _history(model, tokenizer, prefix_cache: KVPrefixCache) -> int:
 def _faked_memory(prefix_cache: KVPrefixCache, working_set: int):
     # GPU memory in use is the weights plus whatever the prefix cache still holds.
     return (
-        patch.object(mx, "get_active_memory", lambda: WEIGHTS + _cached_bytes(prefix_cache)),
+        patch.object(
+            mx, "get_active_memory", lambda: WEIGHTS + _cached_bytes(prefix_cache)
+        ),
         patch.object(mx, "get_cache_memory", lambda: 0),
-        patch.object(mx, "device_info", lambda: {"max_recommended_working_set_size": working_set}),
+        patch.object(
+            mx, "device_info", lambda: {"max_recommended_working_set_size": working_set}
+        ),
     )
 
 
@@ -129,8 +146,9 @@ def test_older_entries_are_evicted_before_a_prefill_that_would_not_fit() -> None
     working_set = WEIGHTS + int(3.5 * entry)
     active, cached, info = _faked_memory(prefix_cache, working_set)
     with active, cached, info:
-        at_prefill = _serve(model, tokenizer, prefix_cache,
-                            mx.concatenate([_prompt(30), _prompt(99)]))
+        at_prefill = _serve(
+            model, tokenizer, prefix_cache, mx.concatenate([_prompt(30), _prompt(99)])
+        )
 
     assert at_prefill["first_tokens"] == [30], at_prefill
     assert at_prefill["matched"] == 30
@@ -143,8 +161,9 @@ def test_nothing_is_evicted_when_memory_is_ample() -> None:
     entry = _history(model, tokenizer, prefix_cache)
     active, cached, info = _faked_memory(prefix_cache, WEIGHTS + 1000 * entry)
     with active, cached, info:
-        at_prefill = _serve(model, tokenizer, prefix_cache,
-                            mx.concatenate([_prompt(30), _prompt(99)]))
+        at_prefill = _serve(
+            model, tokenizer, prefix_cache, mx.concatenate([_prompt(30), _prompt(99)])
+        )
 
     assert sorted(at_prefill["first_tokens"]) == [10, 20, 30]
     assert at_prefill["matched"] == 30
@@ -175,8 +194,9 @@ def test_a_measured_prefill_peak_raises_the_estimate_for_later_prefills(
         cache_module, "_PREFILL_SAMPLE_MIN_TOKENS", PROMPT_TOKENS, raising=False
     )
     # A 64-token prefill that peaks three entries' worth above where it started.
-    peak = patch.object(mx, "get_peak_memory",
-                        lambda: WEIGHTS + _cached_bytes(prefix_cache) + 3 * entry)
+    peak = patch.object(
+        mx, "get_peak_memory", lambda: WEIGHTS + _cached_bytes(prefix_cache) + 3 * entry
+    )
     active, cached, info = _faked_memory(prefix_cache, WEIGHTS + 1000 * entry)
     with active, cached, info, peak:
         _serve(model, tokenizer, prefix_cache, _prompt(40))
@@ -202,8 +222,9 @@ def test_a_measured_prefill_cost_keeps_the_configured_margin(
         cache_module, "_PREFILL_SAMPLE_MIN_TOKENS", PROMPT_TOKENS, raising=False
     )
     monkeypatch.setattr(cache_module, "_PREFILL_MARGIN_BYTES", entry, raising=False)
-    peak = patch.object(mx, "get_peak_memory",
-                        lambda: WEIGHTS + _cached_bytes(prefix_cache) + 3 * entry)
+    peak = patch.object(
+        mx, "get_peak_memory", lambda: WEIGHTS + _cached_bytes(prefix_cache) + 3 * entry
+    )
     active, cached, info = _faked_memory(prefix_cache, WEIGHTS + 1000 * entry)
     with active, cached, info, peak:
         _serve(model, tokenizer, prefix_cache, _prompt(40))
@@ -247,11 +268,18 @@ def _rank(rank: int, hostfile: str, results: Any) -> None:
         mx.distributed.all_gather = counting_gather
         tokens = mx.concatenate([_prompt(30), _prompt(99)])
         _, _, matched, _ = prefix_cache.get_kv_cache(model, tokens)
-        results.put((rank, {
-            "first_tokens": [int(p[0].item()) for p in prefix_cache.prompts],
-            "matched": None if matched is None else int(prefix_cache.prompts[matched][0].item()),
-            "gathers": gathers,
-        }))
+        results.put(
+            (
+                rank,
+                {
+                    "first_tokens": [int(p[0].item()) for p in prefix_cache.prompts],
+                    "matched": None
+                    if matched is None
+                    else int(prefix_cache.prompts[matched][0].item()),
+                    "gathers": gathers,
+                },
+            )
+        )
     except Exception as error:
         results.put((rank, f"{type(error).__name__}: {error}"))
 
@@ -263,7 +291,9 @@ def test_ranks_evict_the_same_entries_when_only_one_lacks_memory() -> None:
         hostfile = f.name
     try:
         results = context.Queue()
-        ranks = [context.Process(target=_rank, args=(r, hostfile, results)) for r in range(2)]
+        ranks = [
+            context.Process(target=_rank, args=(r, hostfile, results)) for r in range(2)
+        ]
         for process in ranks:
             process.start()
         for process in ranks:
